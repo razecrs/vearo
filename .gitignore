@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# training/test artifacts
+*.safetensors
+*.bin
+*.pt
+/checkpoints
+/runs
+
+# local planning notes 
+/ROADMAP.md
+
+# editors
+.idea/
+.vscode/

@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = ""
+description = "Vearo a memory efficient, Rust native deep learning training framework."
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
+perf = "deny"
+
+# Shared dependency versions live here and are referenced from member crates
+# with `dep.workspace = true` as we add them phase by phase.
+[workspace.dependencies]
+vearo-core = { path = "crates/vearo-core" }
+vearo-autograd = { path = "crates/vearo-autograd" }
+vearo-backend-cpu = { path = "crates/vearo-backend-cpu" }
+vearo-nn = { path = "crates/vearo-nn" }
+vearo-optim = { path = "crates/vearo-optim" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+

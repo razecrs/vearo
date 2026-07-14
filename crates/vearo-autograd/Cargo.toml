@@ -1,0 +1,16 @@
+[package]
+name = "vearo-autograd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Eager reverse-mode tape autograd for Vearo."
+
+[lints]
+workspace = true
+
+[dependencies]
+vearo-core.workspace = true
+
+[dev-dependencies]
+vearo-backend-cpu.workspace = true
+

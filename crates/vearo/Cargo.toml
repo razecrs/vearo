@@ -1,0 +1,20 @@
+[package]
+name = "vearo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vearo: a memory-efficient, Rust-native deep learning training framework."
+
+[lints]
+workspace = true
+
+[dependencies]
+vearo-core.workspace = true
+vearo-autograd.workspace = true
+vearo-backend-cpu.workspace = true
+vearo-nn.workspace = true
+vearo-optim.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

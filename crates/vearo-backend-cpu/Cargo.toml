@@ -1,0 +1,13 @@
+[package]
+name = "vearo-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU reference backend for Vearo, serving as the correctness oracle."
+
+[lints]
+workspace = true
+
+[dependencies]
+vearo-core.workspace = true
+

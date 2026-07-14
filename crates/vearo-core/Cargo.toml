@@ -1,0 +1,12 @@
+[package]
+name = "vearo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core tensor primitives for Vearo: dtypes, shapes, devices."
+
+[lints]
+workspace = true
+
+[dependencies]
+

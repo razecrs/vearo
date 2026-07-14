@@ -129,6 +129,7 @@ name = "vearo-nn"
 version = "0.0.1"
 dependencies = [
  "vearo-autograd",
+ "vearo-backend-cpu",
  "vearo-core",
 ]
 
@@ -137,6 +138,7 @@ name = "vearo-optim"
 version = "0.0.1"
 dependencies = [
  "vearo-autograd",
+ "vearo-backend-cpu",
  "vearo-core",
 ]
 

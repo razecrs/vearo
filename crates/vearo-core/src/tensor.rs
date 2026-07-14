@@ -40,10 +40,25 @@ impl Clone for Tensor {
 impl Drop for Tensor {
     fn drop(&mut self) {
         if self.device.is_cpu() {
-            get_cpu_shard(self.storage_id.shard_idx as usize)
+            let mut shard = get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .decrement(self.storage_id.slot_idx);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let is_last =
+                if let Some(Some(slot)) = shard.slots.get(self.storage_id.slot_idx as usize) {
+                    slot.ref_count == 1
+                } else {
+                    false
+                };
+
+            shard.decrement(self.storage_id.slot_idx);
+            if is_last {
+                drop(shard); // Release lock before calling drop_hook to avoid deadlocks
+
+                if let Some(drop_hook) = DROP_HOOK.get() {
+                    drop_hook(self.storage_id);
+                }
+            }
         }
     }
 }
@@ -87,7 +102,10 @@ impl Tensor {
         let storage_id = get_cpu_shard(shard_idx as usize)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .alloc_raw(CpuStorage::F32(data.to_vec()), shard_idx);
+            .alloc_raw(
+                CpuStorage::F32(std::sync::Arc::new(data.to_vec())),
+                shard_idx,
+            );
         Self {
             storage_id,
             shape,
@@ -112,7 +130,10 @@ impl Tensor {
         let storage_id = get_cpu_shard(shard_idx as usize)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .alloc_raw(CpuStorage::I32(data.to_vec()), shard_idx);
+            .alloc_raw(
+                CpuStorage::I32(std::sync::Arc::new(data.to_vec())),
+                shard_idx,
+            );
         Self {
             storage_id,
             shape,
@@ -137,7 +158,10 @@ impl Tensor {
         let storage_id = get_cpu_shard(shard_idx as usize)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .alloc_raw(CpuStorage::I64(data.to_vec()), shard_idx);
+            .alloc_raw(
+                CpuStorage::I64(std::sync::Arc::new(data.to_vec())),
+                shard_idx,
+            );
         Self {
             storage_id,
             shape,
@@ -162,7 +186,10 @@ impl Tensor {
         let storage_id = get_cpu_shard(shard_idx as usize)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .alloc_raw(CpuStorage::Bool(data.to_vec()), shard_idx);
+            .alloc_raw(
+                CpuStorage::Bool(std::sync::Arc::new(data.to_vec())),
+                shard_idx,
+            );
         Self {
             storage_id,
             shape,
@@ -218,7 +245,7 @@ impl Tensor {
                             break;
                         }
                     }
-                    CpuStorage::F32(dest_vec)
+                    CpuStorage::F32(std::sync::Arc::new(dest_vec))
                 }
                 CpuStorage::I32(src_vec) => {
                     let mut dest_vec = vec![0; self.shape.numel()];
@@ -234,7 +261,7 @@ impl Tensor {
                             break;
                         }
                     }
-                    CpuStorage::I32(dest_vec)
+                    CpuStorage::I32(std::sync::Arc::new(dest_vec))
                 }
                 CpuStorage::I64(src_vec) => {
                     let mut dest_vec = vec![0; self.shape.numel()];
@@ -250,7 +277,7 @@ impl Tensor {
                             break;
                         }
                     }
-                    CpuStorage::I64(dest_vec)
+                    CpuStorage::I64(std::sync::Arc::new(dest_vec))
                 }
                 CpuStorage::Bool(src_vec) => {
                     let mut dest_vec = vec![false; self.shape.numel()];
@@ -266,7 +293,7 @@ impl Tensor {
                             break;
                         }
                     }
-                    CpuStorage::Bool(dest_vec)
+                    CpuStorage::Bool(std::sync::Arc::new(dest_vec))
                 }
                 CpuStorage::F16(src_vec) | CpuStorage::BF16(src_vec) => {
                     let mut dest_vec = vec![0; self.shape.numel()];
@@ -283,9 +310,9 @@ impl Tensor {
                         }
                     }
                     if matches!(slot.storage, CpuStorage::F16(_)) {
-                        CpuStorage::F16(dest_vec)
+                        CpuStorage::F16(std::sync::Arc::new(dest_vec))
                     } else {
-                        CpuStorage::BF16(dest_vec)
+                        CpuStorage::BF16(std::sync::Arc::new(dest_vec))
                     }
                 }
             }
@@ -552,6 +579,30 @@ impl Tensor {
         val
     }
 
+    /// Read all values of a contiguous F32 tensor as a Vec.
+    ///
+    /// # Panics
+    /// Panics if the tensor is non-contiguous or not F32.
+    #[must_use]
+    pub fn to_vec_f32(&self) -> Vec<f32> {
+        assert!(
+            self.is_contiguous(),
+            "to_vec_f32 requires contiguous tensor"
+        );
+        let guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = guard.slots[self.storage_id.slot_idx as usize]
+            .as_ref()
+            .expect("Storage slot was empty");
+        let val = match &slot.storage {
+            CpuStorage::F32(vec) => vec.as_ref().clone(),
+            _ => panic!("Expected F32 storage"),
+        };
+        drop(guard);
+        val
+    }
+
     /// Modify a value at a flat index in the storage of a contiguous F32 tensor.
     ///
     /// # Panics
@@ -566,12 +617,217 @@ impl Tensor {
             .unwrap();
         match &mut slot.storage {
             CpuStorage::F32(vec) => {
-                assert!(index < vec.len(), "Index out of bounds");
-                vec[index] = value;
+                let vec_mut = std::sync::Arc::make_mut(vec);
+                assert!(index < vec_mut.len(), "Index out of bounds");
+                vec_mut[index] = value;
             }
             _ => panic!("Expected F32 storage"),
         }
         drop(guard);
+    }
+
+    /// In-place scaled addition: `self += scale * other`.
+    ///
+    /// # Panics
+    /// Panics if shapes do not match, either tensor is non-contiguous, or dtypes are not F32.
+    #[allow(clippy::significant_drop_tightening, clippy::suboptimal_flops)]
+    pub fn add_assign_scaled(&self, other: &Self, scale: f32) {
+        assert_eq!(
+            self.shape, other.shape,
+            "add_assign_scaled shapes must match"
+        );
+        assert!(
+            self.is_contiguous(),
+            "add_assign_scaled self must be contiguous"
+        );
+        assert!(
+            other.is_contiguous(),
+            "add_assign_scaled other must be contiguous"
+        );
+        assert_eq!(self.dtype, DType::F32, "add_assign_scaled self must be F32");
+        assert_eq!(
+            other.dtype,
+            DType::F32,
+            "add_assign_scaled other must be F32"
+        );
+
+        // 1. Read other's data by locking its shard briefly to clone its Arc
+        let other_data = {
+            let guard = get_cpu_shard(other.storage_id.shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = guard.slots[other.storage_id.slot_idx as usize]
+                .as_ref()
+                .expect("Other slot was empty");
+            match &slot.storage {
+                CpuStorage::F32(vec) => vec.clone(),
+                _ => panic!("Expected F32 storage for other"),
+            }
+        };
+
+        // 2. Lock self's shard mutably and perform the scaled addition
+        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = guard.slots[self.storage_id.slot_idx as usize]
+            .as_mut()
+            .expect("Self slot was empty");
+        match &mut slot.storage {
+            CpuStorage::F32(vec) => {
+                let vec_mut = std::sync::Arc::make_mut(vec);
+                for (dest, &src) in vec_mut.iter_mut().zip(other_data.iter()) {
+                    *dest += scale * src;
+                }
+            }
+            _ => panic!("Expected F32 storage for self"),
+        }
+    }
+
+    /// Perform an in-place AdamW step on this tensor's CPU storage.
+    ///
+    /// # Panics
+    /// Panics if shapes do not match, either tensor is non-contiguous, or dtypes are not F32.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::significant_drop_tightening,
+        clippy::suboptimal_flops,
+        clippy::doc_markdown
+    )]
+    pub fn adamw_step(
+        &self,
+        grad: &Self,
+        m: &mut [f32],
+        v: &mut [f32],
+        t: u32,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+    ) {
+        assert_eq!(self.shape, grad.shape, "adamw_step shapes must match");
+        assert!(self.is_contiguous(), "adamw_step self must be contiguous");
+        assert!(grad.is_contiguous(), "adamw_step grad must be contiguous");
+        assert_eq!(self.dtype, DType::F32, "adamw_step self must be F32");
+        assert_eq!(grad.dtype, DType::F32, "adamw_step grad must be F32");
+
+        // 1. Read grad's data by locking its shard briefly to clone its Arc
+        let grad_data = {
+            let guard = get_cpu_shard(grad.storage_id.shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = guard.slots[grad.storage_id.slot_idx as usize]
+                .as_ref()
+                .expect("Grad slot was empty");
+            match &slot.storage {
+                CpuStorage::F32(vec) => vec.clone(),
+                _ => panic!("Expected F32 storage for grad"),
+            }
+        };
+
+        // 2. Lock self's shard mutably and perform the AdamW step elementwise
+        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = guard.slots[self.storage_id.slot_idx as usize]
+            .as_mut()
+            .expect("Self slot was empty");
+        match &mut slot.storage {
+            CpuStorage::F32(vec) => {
+                let vec_mut = std::sync::Arc::make_mut(vec);
+                assert_eq!(
+                    vec_mut.len(),
+                    m.len(),
+                    "Momentum vector m must match parameter length"
+                );
+                assert_eq!(
+                    vec_mut.len(),
+                    v.len(),
+                    "Variance vector v must match parameter length"
+                );
+
+                let bias_correction1 = 1.0 - beta1.powi(i32::try_from(t).unwrap());
+                let bias_correction2 = 1.0 - beta2.powi(i32::try_from(t).unwrap());
+
+                for i in 0..vec_mut.len() {
+                    let g_i = grad_data[i];
+                    m[i] = beta1 * m[i] + (1.0 - beta1) * g_i;
+                    v[i] = beta2 * v[i] + (1.0 - beta2) * g_i * g_i;
+
+                    let m_hat = m[i] / bias_correction1;
+                    let v_hat = v[i] / bias_correction2;
+
+                    // Decoupled weight decay: p = p - lr * weight_decay * p
+                    vec_mut[i] -= lr * weight_decay * vec_mut[i];
+
+                    // Adam update: p = p - lr * m_hat / (sqrt(v_hat) + epsilon)
+                    vec_mut[i] -= lr * m_hat / (v_hat.sqrt() + epsilon);
+                }
+            }
+            _ => panic!("Expected F32 storage for self"),
+        }
+    }
+
+    /// Perform an in-place SGD step with momentum and weight decay on this tensor's CPU storage.
+    ///
+    /// # Panics
+    /// Panics if shapes do not match, either tensor is non-contiguous, or dtypes are not F32.
+    #[allow(clippy::significant_drop_tightening, clippy::suboptimal_flops)]
+    pub fn sgd_step(
+        &self,
+        grad: &Self,
+        velocity: &mut [f32],
+        lr: f32,
+        momentum: f32,
+        weight_decay: f32,
+    ) {
+        assert_eq!(self.shape, grad.shape, "sgd_step shapes must match");
+        assert!(self.is_contiguous(), "sgd_step self must be contiguous");
+        assert!(grad.is_contiguous(), "sgd_step grad must be contiguous");
+        assert_eq!(self.dtype, DType::F32, "sgd_step self must be F32");
+        assert_eq!(grad.dtype, DType::F32, "sgd_step grad must be F32");
+
+        // 1. Read grad's data by locking its shard briefly to clone its Arc
+        let grad_data = {
+            let guard = get_cpu_shard(grad.storage_id.shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = guard.slots[grad.storage_id.slot_idx as usize]
+                .as_ref()
+                .expect("Grad slot was empty");
+            match &slot.storage {
+                CpuStorage::F32(vec) => vec.clone(),
+                _ => panic!("Expected F32 storage for grad"),
+            }
+        };
+
+        // 2. Lock self's shard mutably and perform the SGD step elementwise
+        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = guard.slots[self.storage_id.slot_idx as usize]
+            .as_mut()
+            .expect("Self slot was empty");
+        match &mut slot.storage {
+            CpuStorage::F32(vec) => {
+                let vec_mut = std::sync::Arc::make_mut(vec);
+                assert_eq!(
+                    vec_mut.len(),
+                    velocity.len(),
+                    "Velocity vector must match parameter length"
+                );
+
+                for i in 0..vec_mut.len() {
+                    let mut g_i = grad_data[i];
+                    if weight_decay != 0.0 {
+                        g_i += weight_decay * vec_mut[i];
+                    }
+                    velocity[i] = momentum * velocity[i] + g_i;
+                    vec_mut[i] -= lr * velocity[i];
+                }
+            }
+            _ => panic!("Expected F32 storage for self"),
+        }
     }
 }
 
@@ -586,6 +842,7 @@ pub type ReduceOpFn = fn(&Tensor, usize, bool) -> Tensor;
 
 /// Set of backend implementations for basic tensor operations.
 #[derive(Clone, Copy)]
+#[allow(clippy::type_complexity)]
 pub struct BackendOps {
     /// Elementwise addition function.
     pub add: BinaryOpFn,
@@ -603,6 +860,22 @@ pub struct BackendOps {
     pub sum: ReduceOpFn,
     /// Mean reduction over a single axis.
     pub mean: ReduceOpFn,
+    /// Elementwise `GELU` function.
+    pub gelu: UnaryOpFn,
+    /// Softmax reduction function.
+    pub softmax: fn(&Tensor, usize) -> Tensor,
+    /// Layer normalization function.
+    pub layernorm: fn(&Tensor, &Tensor, &Tensor, f32) -> Tensor,
+    /// Layer normalization backward function.
+    pub layernorm_backward: fn(&Tensor, &Tensor, &Tensor, &Tensor, f32) -> (Tensor, Tensor, Tensor),
+    /// Embedding lookup function.
+    pub embedding: fn(&Tensor, &Tensor) -> Tensor,
+    /// Embedding lookup backward function.
+    pub embedding_backward: fn(&Tensor, &Tensor, &Tensor) -> Tensor,
+    /// Categorical cross-entropy loss function.
+    pub cross_entropy: fn(&Tensor, &Tensor) -> Tensor,
+    /// Categorical cross-entropy loss backward function.
+    pub cross_entropy_backward: fn(&Tensor, &Tensor, &Tensor) -> Tensor,
 }
 
 /// Per-backend registry of op implementations, indexed by [`Device::backend_idx`].
@@ -667,6 +940,14 @@ pub static GRAD_HOOK: std::sync::OnceLock<GradFn> = std::sync::OnceLock::new();
 /// Registers the autograd gradient lookup hook.
 pub fn register_grad_hook(f: GradFn) {
     let _ = GRAD_HOOK.set(f);
+}
+
+/// Global registry for the autograd drop cleanup hook.
+pub static DROP_HOOK: std::sync::OnceLock<fn(StorageId)> = std::sync::OnceLock::new();
+
+/// Registers the autograd drop cleanup hook.
+pub fn register_drop_hook(f: fn(StorageId)) {
+    let _ = DROP_HOOK.set(f);
 }
 
 impl Tensor {
@@ -869,6 +1150,155 @@ impl Tensor {
         }
 
         out
+    }
+
+    /// Elementwise `GELU` activation.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn gelu(&self) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.gelu)(self);
+
+        if is_autograd_enabled() && self.requires_grad() {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record("gelu", &[self], &mut out);
+            }
+        }
+
+        out
+    }
+
+    /// Softmax along a single axis.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device, or `dim` is out of range.
+    #[must_use]
+    pub fn softmax(&self, dim: usize) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.softmax)(self, dim);
+
+        if is_autograd_enabled() && self.requires_grad() {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record(&format!("softmax_{dim}"), &[self], &mut out);
+            }
+        }
+
+        out
+    }
+
+    /// Layer normalization.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn layernorm(&self, weight: &Self, bias: &Self, eps: f32) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.layernorm)(self, weight, bias, eps);
+
+        if is_autograd_enabled()
+            && (self.requires_grad() || weight.requires_grad() || bias.requires_grad())
+        {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record(&format!("layernorm_{eps}"), &[self, weight, bias], &mut out);
+            }
+        }
+
+        out
+    }
+
+    /// Layer normalization backward. Used internally by autograd.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn layernorm_backward(
+        &self,
+        weight: &Self,
+        bias: &Self,
+        grad_out: &Self,
+        eps: f32,
+    ) -> (Self, Self, Self) {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.layernorm_backward)(self, weight, bias, grad_out, eps)
+    }
+
+    /// Embedding lookup.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn embedding(&self, weight: &Self) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.embedding)(self, weight);
+
+        if is_autograd_enabled() && weight.requires_grad() {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record("embedding", &[self, weight], &mut out);
+            }
+        }
+
+        out
+    }
+
+    /// Embedding lookup backward. Used internally by autograd.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn embedding_backward(&self, weight: &Self, grad_out: &Self) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.embedding_backward)(self, weight, grad_out)
+    }
+
+    /// Categorical cross-entropy loss.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn cross_entropy(&self, targets: &Self) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.cross_entropy)(self, targets);
+
+        if is_autograd_enabled() && self.requires_grad() {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record("cross_entropy", &[self, targets], &mut out);
+            }
+        }
+
+        out
+    }
+
+    /// Categorical cross-entropy loss backward. Used internally by autograd.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn cross_entropy_backward(&self, targets: &Self, grad_out: &Self) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.cross_entropy_backward)(self, targets, grad_out)
     }
 }
 

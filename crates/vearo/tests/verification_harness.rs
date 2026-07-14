@@ -29,7 +29,7 @@ fn assert_tensor_close(got: &Tensor, expected_shape: &[usize], expected_data: &[
         .expect("Output slot was empty")
         .storage
     {
-        vearo::core::CpuStorage::F32(v) => v.clone(),
+        vearo::core::CpuStorage::F32(v) => v.as_ref().clone(),
         _ => panic!("Expected F32 storage"),
     };
 
@@ -100,4 +100,138 @@ fn test_numpy_oracle_parity() {
             _ => unreachable!("Unknown operation: {}", case.op),
         }
     }
+}
+
+#[test]
+#[allow(clippy::items_after_statements)]
+fn test_mlp_overfitting() {
+    use vearo::nn::Module;
+    vearo::init();
+
+    // 1. Define XOR dataset: inputs [4, 2], targets [4, 1]
+    let inputs = Tensor::from_f32(&[0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2]);
+    let targets = Tensor::from_f32(&[0.0, 1.0, 1.0, 0.0], [4, 1]);
+
+    // 2. Define a tiny MLP: Linear(2 -> 4) -> ReLU -> Linear(4 -> 1)
+    struct Mlp {
+        fc1: vearo::nn::Linear,
+        fc2: vearo::nn::Linear,
+    }
+
+    impl Mlp {
+        fn forward(&self, x: &Tensor) -> Tensor {
+            let h = self.fc1.forward(x).relu();
+            self.fc2.forward(&h)
+        }
+
+        fn parameters(&self) -> Vec<Tensor> {
+            let mut params = self.fc1.parameters();
+            params.extend(self.fc2.parameters());
+            params
+        }
+    }
+
+    // Initialize with a fixed seed for deterministic behavior
+    let mlp = Mlp {
+        fc1: vearo::nn::Linear::new(2, 4, true, 42),
+        fc2: vearo::nn::Linear::new(4, 1, true, 43),
+    };
+
+    // 3. Setup AdamW optimizer
+    let mut optimizer = vearo::optim::AdamW::new(
+        mlp.parameters(),
+        0.1,   // learning rate
+        0.9,   // beta1
+        0.999, // beta2
+        1e-8,  // eps
+        0.0,   // weight decay
+    );
+
+    // 4. Run training loop to overfit
+    let mut final_loss = 1.0;
+    for _epoch in 0..100 {
+        // Zero gradients and reset tape
+        vearo::autograd::zero_gradients();
+        vearo::autograd::reset_active_tape();
+
+        // Forward
+        let pred = mlp.forward(&inputs);
+
+        // Compute loss: MSE = mean((pred - target)^2)
+        let diff = pred.sub(&targets);
+        let squared = diff.mul(&diff);
+        // Reduce over batch dimension (0), then over output dimension (0)
+        let loss = squared.mean(0, false).mean(0, false);
+
+        final_loss = loss.get_f32(0);
+
+        // Backward
+        loss.backward();
+
+        // Step
+        optimizer.step();
+    }
+
+    println!("Overfitting finished. Final MSE Loss: {final_loss}");
+    // Verify that the loss successfully converged to near zero
+    assert!(
+        final_loss < 5e-3,
+        "MLP failed to overfit XOR batch; final loss was {final_loss}"
+    );
+}
+
+#[test]
+fn test_gpt_overfitting() {
+    vearo::init();
+
+    // 1. Inputs: shape [2, 4], targets: shape [2, 4] (predict next token)
+    let inputs = Tensor::from_f32(&[0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 0.0], [2, 4]);
+    let targets = Tensor::from_f32(&[1.0, 2.0, 3.0, 0.0, 2.0, 3.0, 0.0, 1.0], [2, 4]);
+
+    // 2. Initialize SimpleGPT
+    let gpt = vearo::nn::SimpleGPT::new(
+        8,  // vocab_size
+        4,  // max_seq_len
+        8,  // n_embd
+        2,  // n_head
+        1,  // n_layer
+        16, // mlp_dim
+        42, // seed
+    );
+
+    // 3. Setup AdamW optimizer
+    let mut optimizer = vearo::optim::AdamW::new(
+        gpt.parameters(),
+        0.02, // lr
+        0.9,  // beta1
+        0.95, // beta2
+        1e-8, // eps
+        0.01, // weight_decay
+    );
+
+    // 4. Run training loop to overfit
+    let mut final_loss = 5.0;
+    for _epoch in 0..150 {
+        // Zero gradients and reset tape
+        vearo::autograd::zero_gradients();
+        vearo::autograd::reset_active_tape();
+
+        // Forward
+        let (_logits, loss_opt) = gpt.forward(&inputs, Some(&targets));
+        let loss = loss_opt.unwrap();
+
+        final_loss = loss.get_f32(0);
+
+        // Backward
+        loss.backward();
+
+        // Step
+        optimizer.step();
+    }
+
+    println!("GPT overfitting finished. Final Cross Entropy Loss: {final_loss}");
+    assert!(
+        final_loss < 0.05,
+        "SimpleGPT failed to overfit; final loss was {final_loss}"
+    );
 }

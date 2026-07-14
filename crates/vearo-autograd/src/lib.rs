@@ -39,6 +39,22 @@ pub enum OpType {
     },
     /// Elementwise `ReLU`.
     Relu,
+    /// Elementwise `GELU`.
+    Gelu,
+    /// Softmax over a single axis.
+    Softmax {
+        /// The softmax axis.
+        dim: usize,
+    },
+    /// Layer normalization.
+    LayerNorm {
+        /// Numerical stability epsilon represented as bits.
+        eps_bits: u32,
+    },
+    /// Embedding lookup.
+    Embedding,
+    /// Categorical cross-entropy loss.
+    CrossEntropy,
     /// Sum over a single axis.
     Sum {
         /// The reduced axis.
@@ -168,6 +184,14 @@ fn record_op_callback(op_name: &str, inputs: &[&Tensor], output: &mut Tensor) {
             .map(|s| s.parse::<usize>().unwrap())
             .collect();
         OpType::Permute { axes }
+    } else if let Some(stripped) = op_name.strip_prefix("softmax_") {
+        let dim = stripped.parse::<usize>().unwrap();
+        OpType::Softmax { dim }
+    } else if let Some(stripped) = op_name.strip_prefix("layernorm_") {
+        let eps = stripped.parse::<f32>().unwrap();
+        OpType::LayerNorm {
+            eps_bits: eps.to_bits(),
+        }
     } else if let Some(stripped) = op_name.strip_prefix("sum_") {
         let (dim, keep_dim) = parse_reduce_args(stripped);
         OpType::Sum { dim, keep_dim }
@@ -182,6 +206,9 @@ fn record_op_callback(op_name: &str, inputs: &[&Tensor], output: &mut Tensor) {
             "div" => OpType::Div,
             "matmul" => OpType::Matmul,
             "relu" => OpType::Relu,
+            "gelu" => OpType::Gelu,
+            "embedding" => OpType::Embedding,
+            "cross_entropy" => OpType::CrossEntropy,
             _ => panic!("Unknown operation to record: {op_name}"),
         }
     };
@@ -200,12 +227,16 @@ fn reduce_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
     if grad.shape().dims() == target_shape {
         return grad.clone();
     }
+    if grad.shape().numel() == 0 {
+        return Tensor::zeros(target_shape, grad.dtype());
+    }
     let out_numel = target_shape.iter().product::<usize>();
     let mut out_data = vec![0.0; out_numel];
 
     let grad_shape = grad.shape();
     let mut iter = vearo_core::NdIterator::new(*grad_shape);
     let grad_contiguous = grad.contiguous();
+    let grad_vec = grad_contiguous.to_vec_f32();
 
     let mut i = 0;
     loop {
@@ -215,6 +246,10 @@ fn reduce_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
 
         let grad_rank = grad_shape.rank();
         let target_rank = target_shape.len();
+        assert!(
+            grad_rank >= target_rank,
+            "Grad rank {grad_rank} must be >= target rank {target_rank}"
+        );
         for d in (0..target_rank).rev() {
             let grad_d = grad_rank - target_rank + d;
             let c = coord[grad_d];
@@ -223,7 +258,7 @@ fn reduce_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
             stride *= target_shape[d];
         }
 
-        let val = grad_contiguous.get_f32(i);
+        let val = grad_vec[i];
         out_data[target_idx] += val;
 
         i += 1;
@@ -238,11 +273,41 @@ fn reduce_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
 /// Builds the `ReLU` gradient mask: 1.0 where `x > 0`, else 0.0.
 fn relu_grad_mask(x: &Tensor) -> Tensor {
     let xc = x.contiguous();
+    let xc_vec = xc.to_vec_f32();
     let mut data = vec![0.0f32; xc.shape().numel()];
     for (i, d) in data.iter_mut().enumerate() {
-        if xc.get_f32(i) > 0.0 {
+        if xc_vec[i] > 0.0 {
             *d = 1.0;
         }
+    }
+    Tensor::from_f32(&data, *xc.shape())
+}
+
+/// Builds the `GELU` gradient mask (derivative of GELU tanh approximation).
+#[allow(
+    clippy::items_after_statements,
+    clippy::excessive_precision,
+    clippy::needless_range_loop,
+    clippy::suboptimal_flops
+)]
+fn gelu_grad_mask(x: &Tensor) -> Tensor {
+    let xc = x.contiguous();
+    let xc_vec = xc.to_vec_f32();
+    let mut data = vec![0.0f32; xc.shape().numel()];
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    const COEFF: f32 = 0.044_715;
+    const DERIV_COEFF: f32 = 0.134_145; // 3 * 0.044715
+
+    for i in 0..data.len() {
+        let v = xc_vec[i];
+        let v3 = v * v * v;
+        let inner = SQRT_2_OVER_PI * (v + COEFF * v3);
+        let t = inner.tanh();
+        let t_sq = t * t;
+        let sech_sq = 1.0 - t_sq;
+        let inner_deriv = SQRT_2_OVER_PI * (1.0 + DERIV_COEFF * v * v);
+
+        data[i] = 0.5 * (1.0 + t) + 0.5 * v * sech_sq * inner_deriv;
     }
     Tensor::from_f32(&data, *xc.shape())
 }
@@ -386,6 +451,38 @@ fn backward_callback(output: &Tensor) {
                 let mask = relu_grad_mask(x);
                 vec![grad_out.mul(&mask)]
             }
+            OpType::Gelu => {
+                let x = &node.saved_tensors[0];
+                let mask = gelu_grad_mask(x);
+                vec![grad_out.mul(&mask)]
+            }
+            OpType::Softmax { dim } => {
+                let x = &node.saved_tensors[0];
+                let y = x.softmax(*dim);
+                let sum_grad_y = grad_out.mul(&y).sum(*dim, true);
+                let gl = y.mul(&grad_out.sub(&sum_grad_y));
+                vec![gl]
+            }
+            OpType::LayerNorm { eps_bits } => {
+                let x = &node.saved_tensors[0];
+                let weight = &node.saved_tensors[1];
+                let bias = &node.saved_tensors[2];
+                let eps = f32::from_bits(*eps_bits);
+                let (gx, gw, gb) = x.layernorm_backward(weight, bias, &grad_out, eps);
+                vec![gx, gw, gb]
+            }
+            OpType::Embedding => {
+                let x = &node.saved_tensors[0];
+                let weight = &node.saved_tensors[1];
+                let gw = x.embedding_backward(weight, &grad_out);
+                vec![Tensor::zeros(*x.shape(), vearo_core::DType::F32), gw]
+            }
+            OpType::CrossEntropy => {
+                let logits = &node.saved_tensors[0];
+                let targets = &node.saved_tensors[1];
+                let gl = logits.cross_entropy_backward(targets, &grad_out);
+                vec![gl, Tensor::zeros(*targets.shape(), vearo_core::DType::F32)]
+            }
             OpType::Sum { dim, keep_dim } => {
                 let x = &node.saved_tensors[0];
                 vec![expand_reduce_grad(&grad_out, x.shape(), *dim, *keep_dim)]
@@ -412,18 +509,29 @@ fn backward_callback(output: &Tensor) {
         }
     }
 
+    let current_gen = TAPE.with(|t| t.borrow().generation);
+
     // 5. Save the final calculated gradients to the thread-local storage map
     GRADIENTS.with(|g| {
         let mut g = g.borrow_mut();
         g.clear();
         for node in &nodes {
             for (i, input) in node.saved_tensors.iter().enumerate() {
-                if let Some(grad_tensor) = node
-                    .inputs
-                    .get(i)
-                    .and_then(Option::as_ref)
-                    .and_then(|id| grad_map.get(id))
-                {
+                let is_leaf = input.node_id().is_some_and(|tok| {
+                    let (token_gen, idx) = Tape::unpack(tok);
+                    token_gen == current_gen && nodes[idx as usize].inputs.is_empty()
+                });
+
+                let grad_opt = if is_leaf {
+                    node.inputs
+                        .get(i)
+                        .and_then(Option::as_ref)
+                        .and_then(|id| grad_map.get(id))
+                } else {
+                    None
+                };
+
+                if let Some(grad_tensor) = grad_opt {
                     g.insert(input.storage_id(), grad_tensor.clone());
                 }
             }
@@ -439,7 +547,24 @@ fn backward_callback(output: &Tensor) {
 
 /// Dynamic gradient lookup callback.
 fn grad_callback(tensor: &Tensor) -> Option<Tensor> {
-    GRADIENTS.with(|g| g.borrow().get(&tensor.storage_id()).cloned())
+    GRADIENTS
+        .try_with(|g| {
+            g.try_borrow()
+                .map(|g_ref| g_ref.get(&tensor.storage_id()).cloned())
+                .ok()
+                .flatten()
+        })
+        .ok()
+        .flatten()
+}
+
+/// Dynamic drop cleanup callback.
+fn drop_callback(storage_id: StorageId) {
+    let _ = GRADIENTS.try_with(|g| {
+        if let Ok(mut g_ref) = g.try_borrow_mut() {
+            g_ref.remove(&storage_id);
+        }
+    });
 }
 
 /// Initializes the autograd hook overrides.
@@ -447,6 +572,21 @@ pub fn init() {
     register_record_op(record_op_callback);
     register_backward_hook(backward_callback);
     register_grad_hook(grad_callback);
+    vearo_core::register_drop_hook(drop_callback);
+}
+
+/// Resets the active autograd tape for the current thread.
+pub fn reset_active_tape() {
+    TAPE.with(|t| t.borrow_mut().reset());
+}
+
+/// Clear all active gradients in the thread-local gradients map.
+pub fn zero_gradients() {
+    let _ = GRADIENTS.try_with(|g| {
+        if let Ok(mut g_ref) = g.try_borrow_mut() {
+            g_ref.clear();
+        }
+    });
 }
 
 /// Computes the numerical gradient of a scalar-valued function `f` with respect to input `x`.
@@ -786,5 +926,218 @@ mod tests {
                 grad_x_num.get_f32(i)
             );
         }
+    }
+
+    #[test]
+    fn test_autograd_gelu() {
+        vearo_backend_cpu::init();
+        init();
+
+        let x = Tensor::from_f32(&[-1.0, 0.0, 1.0, 2.0], [4]);
+        x.set_requires_grad(true);
+
+        let forward = |t_x: &Tensor| {
+            let out = t_x.gelu();
+            out.sum(0, false)
+        };
+
+        let out = forward(&x);
+        out.backward();
+
+        let grad_x_ana = x.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_x_num = numerical_grad(forward, &x, 1e-4);
+
+        for i in 0..4 {
+            let diff = (grad_x_ana.get_f32(i) - grad_x_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on gelu at index {}: ana={}, num={}",
+                i,
+                grad_x_ana.get_f32(i),
+                grad_x_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_autograd_softmax() {
+        vearo_backend_cpu::init();
+        init();
+
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        x.set_requires_grad(true);
+
+        let target = Tensor::from_f32(&[0.5, 0.5, 0.2, 0.8], [2, 2]);
+
+        let forward = |t_x: &Tensor| {
+            let sm = t_x.softmax(1);
+            let out = sm.mul(&target);
+            out.sum(0, false).sum(0, false)
+        };
+
+        let out = forward(&x);
+        out.backward();
+
+        let grad_x_ana = x.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_x_num = numerical_grad(forward, &x, 1e-4);
+
+        for i in 0..4 {
+            let diff = (grad_x_ana.get_f32(i) - grad_x_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on softmax at index {}: ana={}, num={}",
+                i,
+                grad_x_ana.get_f32(i),
+                grad_x_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_autograd_layernorm() {
+        vearo_backend_cpu::init();
+        init();
+
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        let weight = Tensor::from_f32(&[0.5, 1.5], [2]);
+        let bias = Tensor::from_f32(&[0.1, -0.1], [2]);
+
+        x.set_requires_grad(true);
+        weight.set_requires_grad(true);
+        bias.set_requires_grad(true);
+
+        let forward = |t_x: &Tensor| {
+            let out = t_x.layernorm(&weight, &bias, 1e-5);
+            out.sum(0, false).sum(0, false)
+        };
+
+        let out = forward(&x);
+        out.backward();
+
+        let grad_x_ana = x.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_x_num = numerical_grad(forward, &x, 1e-4);
+
+        for i in 0..4 {
+            let diff = (grad_x_ana.get_f32(i) - grad_x_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on layernorm X at {}: ana={}, num={}",
+                i,
+                grad_x_ana.get_f32(i),
+                grad_x_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_autograd_embedding() {
+        vearo_backend_cpu::init();
+        init();
+
+        let x = Tensor::from_f32(&[0.0, 1.0], [2]);
+        let weight = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]);
+        weight.set_requires_grad(true);
+
+        let forward_weight = |t_w: &Tensor| {
+            let out = x.embedding(t_w);
+            out.sum(0, false).sum(0, false)
+        };
+
+        let out = forward_weight(&weight);
+        out.backward();
+
+        let grad_w_ana = weight.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_w_num = numerical_grad(forward_weight, &weight, 1e-3);
+
+        for i in 0..6 {
+            let diff = (grad_w_ana.get_f32(i) - grad_w_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on embedding Weight at {}: ana={}, num={}",
+                i,
+                grad_w_ana.get_f32(i),
+                grad_w_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_autograd_cross_entropy() {
+        vearo_backend_cpu::init();
+        init();
+
+        let logits = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        let targets = Tensor::from_f32(&[1.0, 0.0], [2]);
+
+        logits.set_requires_grad(true);
+
+        let forward = |t_l: &Tensor| t_l.cross_entropy(&targets);
+
+        let out = forward(&logits);
+        out.backward();
+
+        let grad_logits_ana = logits.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_logits_num = numerical_grad(forward, &logits, 1e-3);
+
+        for i in 0..4 {
+            let diff = (grad_logits_ana.get_f32(i) - grad_logits_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on cross_entropy Logits at {}: ana={}, num={}",
+                i,
+                grad_logits_ana.get_f32(i),
+                grad_logits_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::collection_is_never_read)] // held only to keep slots alive
+    fn test_stale_gradient_prevention() {
+        vearo_backend_cpu::init();
+        init();
+
+        let x = Tensor::from_f32(&[2.0], [1]);
+        x.set_requires_grad(true);
+        let y = x.mul(&x); // y = x^2
+        y.backward();
+
+        let x_grad = x.grad().unwrap();
+        assert_eq!(x_grad.get_f32(0), 4.0);
+
+        let old_id = x.storage_id();
+
+        // Now, we drop x and the gradient and y to free all references to the slot
+        drop(x_grad);
+        drop(y);
+        drop(x);
+
+        // We allocate new tensors in a loop, keeping them alive, until we reuse the old_id slot.
+        let mut held_tensors = Vec::new();
+        let mut reused_tensor = None;
+        for _ in 0..100 {
+            let t = Tensor::from_f32(&[5.0], [1]);
+            if t.storage_id() == old_id {
+                reused_tensor = Some(t);
+                break;
+            }
+            held_tensors.push(t);
+        }
+
+        let t = reused_tensor.expect("Should have reused the old storage slot");
+        assert!(
+            t.grad().is_none(),
+            "Stale gradient bug detected! Reused tensor got old gradient."
+        );
     }
 }

@@ -11,4 +11,5 @@ workspace = true
 [dependencies]
 vearo-core.workspace = true
 vearo-autograd.workspace = true
-
+[dev-dependencies]
+vearo-backend-cpu.workspace = true

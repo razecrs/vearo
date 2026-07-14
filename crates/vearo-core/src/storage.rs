@@ -20,17 +20,17 @@ pub struct StorageId {
 #[derive(Debug, Clone)]
 pub enum CpuStorage {
     /// 32-bit float storage.
-    F32(Vec<f32>),
+    F32(std::sync::Arc<Vec<f32>>),
     /// 16-bit float storage.
-    F16(Vec<u16>),
+    F16(std::sync::Arc<Vec<u16>>),
     /// 16-bit brain float storage.
-    BF16(Vec<u16>),
+    BF16(std::sync::Arc<Vec<u16>>),
     /// 32-bit integer storage.
-    I32(Vec<i32>),
+    I32(std::sync::Arc<Vec<i32>>),
     /// 64-bit integer storage.
-    I64(Vec<i64>),
+    I64(std::sync::Arc<Vec<i64>>),
     /// Boolean storage.
-    Bool(Vec<bool>),
+    Bool(std::sync::Arc<Vec<bool>>),
 }
 
 /// A slot in a CPU storage arena shard.
@@ -64,12 +64,12 @@ impl CpuArenaShard {
     /// Allocates a new zero-filled storage block in this shard.
     pub fn alloc(&mut self, numel: usize, dtype: DType, shard_idx: u8) -> StorageId {
         let storage = match dtype {
-            DType::F32 => CpuStorage::F32(vec![0.0; numel]),
-            DType::F16 => CpuStorage::F16(vec![0; numel]),
-            DType::BF16 => CpuStorage::BF16(vec![0; numel]),
-            DType::I32 => CpuStorage::I32(vec![0; numel]),
-            DType::I64 => CpuStorage::I64(vec![0; numel]),
-            DType::Bool => CpuStorage::Bool(vec![false; numel]),
+            DType::F32 => CpuStorage::F32(std::sync::Arc::new(vec![0.0; numel])),
+            DType::F16 => CpuStorage::F16(std::sync::Arc::new(vec![0; numel])),
+            DType::BF16 => CpuStorage::BF16(std::sync::Arc::new(vec![0; numel])),
+            DType::I32 => CpuStorage::I32(std::sync::Arc::new(vec![0; numel])),
+            DType::I64 => CpuStorage::I64(std::sync::Arc::new(vec![0; numel])),
+            DType::Bool => CpuStorage::Bool(std::sync::Arc::new(vec![false; numel])),
         };
         self.alloc_raw(storage, shard_idx)
     }
@@ -203,9 +203,9 @@ mod tests {
     #[test]
     fn arena_alloc_raw_preserves_data() {
         let mut arena = CpuArenaShard::new();
-        let id = arena.alloc_raw(CpuStorage::F32(vec![1.0, 2.0, 3.0]), 0);
+        let id = arena.alloc_raw(CpuStorage::F32(std::sync::Arc::new(vec![1.0, 2.0, 3.0])), 0);
         match &arena.slots[id.slot_idx as usize].as_ref().unwrap().storage {
-            CpuStorage::F32(v) => assert_eq!(v, &[1.0, 2.0, 3.0]),
+            CpuStorage::F32(v) => assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]),
             _ => unreachable!(),
         }
     }

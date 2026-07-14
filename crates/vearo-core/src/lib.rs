@@ -18,7 +18,8 @@ pub use storage::{
 };
 pub use tensor::{
     BackendOps, BackwardFn, GradFn, RecordOpFn, Tensor, is_autograd_enabled, register_backend_ops,
-    register_backward_hook, register_grad_hook, register_record_op, set_autograd_enabled,
+    register_backward_hook, register_drop_hook, register_grad_hook, register_record_op,
+    set_autograd_enabled,
 };
 
 #[cfg(test)]
@@ -160,7 +161,7 @@ mod tests {
             .unwrap()
             .storage
         {
-            CpuStorage::F32(vec) => assert_eq!(vec, &vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
+            CpuStorage::F32(vec) => assert_eq!(vec.as_ref(), &vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
             _ => unreachable!(),
         }
     }

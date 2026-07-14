@@ -9,6 +9,9 @@ Cargo.lock.orig
 /checkpoints
 /runs
 
+# datasets (MNIST etc.) - fetched locally, never committed
+/data/
+
 # local planning notes 
 /ROADMAP.md
 

@@ -1,4 +1,13 @@
 //! CPU reference backend implementations.
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::missing_panics_doc,
+    clippy::uninlined_format_args,
+    clippy::similar_names,
+    clippy::excessive_precision,
+    clippy::items_after_statements
+)]
 
 use vearo_core::{
     BackendOps, CpuArenaShard, CpuStorage, Device, NdIterator, Shape, Tensor, get_cpu_shard,
@@ -20,6 +29,14 @@ pub fn init() {
             relu,
             sum,
             mean,
+            gelu,
+            softmax,
+            layernorm,
+            layernorm_backward,
+            embedding,
+            embedding_backward,
+            cross_entropy,
+            cross_entropy_backward,
         },
     );
 }
@@ -95,11 +112,11 @@ impl LockedShards {
     }
 }
 
-/// Clone out the F32 backing buffer of a tensor under its shard lock.
+/// Obtain the F32 backing buffer of a tensor under its shard lock by cloning the Arc.
 ///
-/// Copying out lets the caller compute with **no locks held**, so an op never
-/// pins a shard for the duration of its work.
-fn read_f32(t: &Tensor) -> Vec<f32> {
+/// Cloning the Arc lets the caller compute with **no locks held** and performs zero
+/// copying or allocations of the underlying buffer.
+fn read_f32(t: &Tensor) -> std::sync::Arc<Vec<f32>> {
     let guard = get_cpu_shard(t.storage_id().shard_idx as usize)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -120,14 +137,10 @@ fn write_f32(t: &Tensor, data: Vec<f32>) {
     let mut guard = get_cpu_shard(t.storage_id().shard_idx as usize)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match &mut guard.slots[t.storage_id().slot_idx as usize]
+    let slot = guard.slots[t.storage_id().slot_idx as usize]
         .as_mut()
-        .expect("Output slot was empty")
-        .storage
-    {
-        CpuStorage::F32(v) => *v = data,
-        _ => panic!("Only F32 supported"),
-    }
+        .expect("Output slot was empty");
+    slot.storage = CpuStorage::F32(std::sync::Arc::new(data));
     drop(guard);
 }
 
@@ -150,16 +163,22 @@ fn elementwise_op(lhs: &Tensor, rhs: &Tensor, op: impl Fn(f32, f32) -> f32) -> T
     let rhs_data = read_f32(rhs);
 
     let mut out_data = vec![0.0f32; out_shape.numel()];
-    let mut iter = NdIterator::new(out_shape);
-    let mut i = 0;
-    loop {
-        let coord = iter.coord();
-        let l_offset = get_offset(coord, lhs.shape(), lhs.strides());
-        let r_offset = get_offset(coord, rhs.shape(), rhs.strides());
-        out_data[i] = op(lhs_data[l_offset], rhs_data[r_offset]);
-        i += 1;
-        if !iter.step() {
-            break;
+    if lhs.is_contiguous() && rhs.is_contiguous() && lhs.shape() == rhs.shape() {
+        for i in 0..out_shape.numel() {
+            out_data[i] = op(lhs_data[i], rhs_data[i]);
+        }
+    } else {
+        let mut iter = NdIterator::new(out_shape);
+        let mut i = 0;
+        loop {
+            let coord = iter.coord();
+            let l_offset = get_offset(coord, lhs.shape(), lhs.strides());
+            let r_offset = get_offset(coord, rhs.shape(), rhs.strides());
+            out_data[i] = op(lhs_data[l_offset], rhs_data[r_offset]);
+            i += 1;
+            if !iter.step() {
+                break;
+            }
         }
     }
 
@@ -302,13 +321,129 @@ pub fn relu(x: &Tensor) -> Tensor {
 
     let x_data = read_f32(x);
     let mut out_data = vec![0.0f32; x.shape().numel()];
-    let mut iter = NdIterator::new(*x.shape());
-    let mut i = 0;
+    if x.is_contiguous() {
+        for i in 0..x.shape().numel() {
+            let v = x_data[i];
+            out_data[i] = if v > 0.0 { v } else { 0.0 };
+        }
+    } else {
+        let mut iter = NdIterator::new(*x.shape());
+        let mut i = 0;
+        loop {
+            let off = get_offset(iter.coord(), x.shape(), x.strides());
+            let v = x_data[off];
+            out_data[i] = if v > 0.0 { v } else { 0.0 };
+            i += 1;
+            if !iter.step() {
+                break;
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Elementwise `GELU` on CPU using tanh approximation.
+#[must_use]
+pub fn gelu(x: &Tensor) -> Tensor {
+    assert_eq!(x.dtype(), vearo_core::DType::F32, "Only F32 supported");
+    let out = Tensor::zeros(*x.shape(), vearo_core::DType::F32);
+    if x.shape().numel() == 0 {
+        return out;
+    }
+
+    let x_data = read_f32(x);
+    let mut out_data = vec![0.0f32; x.shape().numel()];
+
+    // Tanh approximation constants
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    const COEFF: f32 = 0.044_715;
+
+    if x.is_contiguous() {
+        for i in 0..x.shape().numel() {
+            let v = x_data[i];
+            let v3 = v * v * v;
+            let inner = SQRT_2_OVER_PI * (v + COEFF * v3);
+            out_data[i] = 0.5 * v * (1.0 + inner.tanh());
+        }
+    } else {
+        let mut iter = NdIterator::new(*x.shape());
+        let mut i = 0;
+        loop {
+            let off = get_offset(iter.coord(), x.shape(), x.strides());
+            let v = x_data[off];
+            let v3 = v * v * v;
+            let inner = SQRT_2_OVER_PI * (v + COEFF * v3);
+            out_data[i] = 0.5 * v * (1.0 + inner.tanh());
+            i += 1;
+            if !iter.step() {
+                break;
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Softmax along a single axis `dim` on CPU.
+#[must_use]
+pub fn softmax(x: &Tensor, dim: usize) -> Tensor {
+    assert_eq!(x.dtype(), vearo_core::DType::F32, "Only F32 supported");
+    let rank = x.shape().rank();
+    assert!(dim < rank, "Softmax dim out of range");
+
+    let out = Tensor::zeros(*x.shape(), vearo_core::DType::F32);
+    if x.shape().numel() == 0 {
+        return out;
+    }
+
+    let x_data = read_f32(x);
+    let mut out_data = vec![0.0f32; x.shape().numel()];
+
+    let dims = x.shape().dims();
+    let dim_size = dims[dim];
+
+    let mut reduced_dims = dims.to_vec();
+    reduced_dims[dim] = 1;
+    let reduced_shape = Shape::new(&reduced_dims);
+
+    let mut iter = NdIterator::new(reduced_shape);
     loop {
-        let off = get_offset(iter.coord(), x.shape(), x.strides());
-        let v = x_data[off];
-        out_data[i] = if v > 0.0 { v } else { 0.0 };
-        i += 1;
+        let mut coord = iter.coord().to_vec();
+
+        // 1. Find max value along `dim` for numerical stability
+        let mut max_val = f32::NEG_INFINITY;
+        for d_idx in 0..dim_size {
+            coord[dim] = d_idx;
+            let off = get_offset(&coord, x.shape(), x.strides());
+            let val = x_data[off];
+            if val > max_val {
+                max_val = val;
+            }
+        }
+
+        // 2. Compute sum of exponentials
+        let mut sum_exp = 0.0f32;
+        for d_idx in 0..dim_size {
+            coord[dim] = d_idx;
+            let off = get_offset(&coord, x.shape(), x.strides());
+            let val = x_data[off];
+            sum_exp += (val - max_val).exp();
+        }
+
+        // 3. Write softmax values into out_data
+        for d_idx in 0..dim_size {
+            coord[dim] = d_idx;
+            let off = get_offset(&coord, x.shape(), x.strides());
+            let val = x_data[off];
+            let sm_val = (val - max_val).exp() / sum_exp;
+
+            let out_off = get_offset(&coord, x.shape(), &x.shape().contiguous_strides());
+            out_data[out_off] = sm_val;
+        }
+
         if !iter.step() {
             break;
         }
@@ -408,6 +543,481 @@ pub fn mean(x: &Tensor, dim: usize, keep_dim: bool) -> Tensor {
     out
 }
 
+fn flat_to_coord(mut index: usize, shape: &Shape) -> Vec<usize> {
+    let dims = shape.dims();
+    let mut coord = vec![0; dims.len()];
+    for i in (0..dims.len()).rev() {
+        coord[i] = index % dims[i];
+        index /= dims[i];
+    }
+    coord
+}
+
+/// Layer normalization forward on CPU.
+#[must_use]
+pub fn layernorm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Tensor {
+    assert_eq!(x.dtype(), vearo_core::DType::F32, "Only F32 supported");
+    let out = Tensor::zeros(*x.shape(), vearo_core::DType::F32);
+    if x.shape().numel() == 0 {
+        return out;
+    }
+
+    let dims = x.shape().dims();
+    let rank = dims.len();
+    assert!(rank >= 1, "LayerNorm input must be at least rank 1");
+    let norm_dim = dims[rank - 1];
+
+    assert_eq!(weight.shape().rank(), 1, "LayerNorm weight must be rank 1");
+    assert_eq!(bias.shape().rank(), 1, "LayerNorm bias must be rank 1");
+    assert_eq!(
+        weight.shape()[0],
+        norm_dim,
+        "Weight dimension must match norm_dim"
+    );
+    assert_eq!(
+        bias.shape()[0],
+        norm_dim,
+        "Bias dimension must match norm_dim"
+    );
+
+    let x_data = read_f32(x);
+    let w_data = read_f32(weight);
+    let b_data = read_f32(bias);
+    let mut out_data = vec![0.0f32; x.shape().numel()];
+
+    let outer_numel = x.shape().numel() / norm_dim;
+
+    for b in 0..outer_numel {
+        let base_idx = b * norm_dim;
+
+        // 1. Calculate mean
+        let mut sum = 0.0f32;
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let off = get_offset(&coord, x.shape(), x.strides());
+            sum += x_data[off];
+        }
+        let mean = sum / (norm_dim as f32);
+
+        // 2. Calculate variance
+        let mut sum_sq = 0.0f32;
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let off = get_offset(&coord, x.shape(), x.strides());
+            let diff = x_data[off] - mean;
+            sum_sq += diff * diff;
+        }
+        let var = sum_sq / (norm_dim as f32);
+        let inv_std = 1.0 / (var + eps).sqrt();
+
+        // 3. Normalize, scale, and shift
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let off = get_offset(&coord, x.shape(), x.strides());
+
+            let x_hat = (x_data[off] - mean) * inv_std;
+            let out_idx = base_idx + i;
+
+            let w_coord = [i];
+            let w_off = get_offset(&w_coord, weight.shape(), weight.strides());
+            let b_off = get_offset(&w_coord, bias.shape(), bias.strides());
+
+            out_data[out_idx] = x_hat * w_data[w_off] + b_data[b_off];
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Layer normalization backward on CPU.
+#[must_use]
+#[allow(clippy::similar_names)]
+pub fn layernorm_backward(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    grad_out: &Tensor,
+    eps: f32,
+) -> (Tensor, Tensor, Tensor) {
+    let grad_x = Tensor::zeros(*x.shape(), vearo_core::DType::F32);
+    let grad_w = Tensor::zeros(*weight.shape(), vearo_core::DType::F32);
+    let grad_b = Tensor::zeros(*bias.shape(), vearo_core::DType::F32);
+
+    if x.shape().numel() == 0 {
+        return (grad_x, grad_w, grad_b);
+    }
+
+    let dims = x.shape().dims();
+    let rank = dims.len();
+    assert!(rank >= 1, "LayerNorm input must be at least rank 1");
+    let norm_dim = dims[rank - 1];
+
+    assert_eq!(weight.shape().rank(), 1, "LayerNorm weight must be rank 1");
+    assert_eq!(bias.shape().rank(), 1, "LayerNorm bias must be rank 1");
+    assert_eq!(
+        weight.shape()[0],
+        norm_dim,
+        "Weight dimension must match norm_dim"
+    );
+    assert_eq!(
+        bias.shape()[0],
+        norm_dim,
+        "Bias dimension must match norm_dim"
+    );
+
+    let x_data = read_f32(x);
+    let w_data = read_f32(weight);
+    let go_data = read_f32(grad_out);
+
+    let mut gx_data = vec![0.0f32; x.shape().numel()];
+    let mut gw_data = vec![0.0f32; weight.shape().numel()];
+    let mut gb_data = vec![0.0f32; bias.shape().numel()];
+
+    let outer_numel = x.shape().numel() / norm_dim;
+
+    for b in 0..outer_numel {
+        let base_idx = b * norm_dim;
+
+        // 1. Re-calculate mean and variance for x_hat
+        let mut sum = 0.0f32;
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let off = get_offset(&coord, x.shape(), x.strides());
+            sum += x_data[off];
+        }
+        let mean = sum / (norm_dim as f32);
+
+        let mut sum_sq = 0.0f32;
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let off = get_offset(&coord, x.shape(), x.strides());
+            let diff = x_data[off] - mean;
+            sum_sq += diff * diff;
+        }
+        let var = sum_sq / (norm_dim as f32);
+        let inv_std = 1.0 / (var + eps).sqrt();
+
+        // 2. Compute intermediates for grad_x
+        let mut sum_go_w = 0.0f32;
+        let mut sum_go_w_xhat = 0.0f32;
+
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let go_off = get_offset(&coord, grad_out.shape(), grad_out.strides());
+            let x_off = get_offset(&coord, x.shape(), x.strides());
+
+            let x_hat = (x_data[x_off] - mean) * inv_std;
+
+            let w_coord = [i];
+            let w_off = get_offset(&w_coord, weight.shape(), weight.strides());
+            let w_val = w_data[w_off];
+            let go_val = go_data[go_off];
+
+            sum_go_w += go_val * w_val;
+            sum_go_w_xhat += go_val * w_val * x_hat;
+
+            gw_data[i] += go_val * x_hat;
+            gb_data[i] += go_val;
+        }
+
+        // 3. Compute grad_x
+        for i in 0..norm_dim {
+            let coord = flat_to_coord(base_idx + i, x.shape());
+            let go_off = get_offset(&coord, grad_out.shape(), grad_out.strides());
+            let x_off = get_offset(&coord, x.shape(), x.strides());
+            let x_hat = (x_data[x_off] - mean) * inv_std;
+
+            let w_coord = [i];
+            let w_off = get_offset(&w_coord, weight.shape(), weight.strides());
+            let w_val = w_data[w_off];
+            let go_val = go_data[go_off];
+
+            let term1 = (norm_dim as f32) * go_val * w_val;
+            let term2 = sum_go_w;
+            let term3 = x_hat * sum_go_w_xhat;
+
+            gx_data[base_idx + i] = (term1 - term2 - term3) * inv_std / (norm_dim as f32);
+        }
+    }
+
+    write_f32(&grad_x, gx_data);
+    write_f32(&grad_w, gw_data);
+    write_f32(&grad_b, gb_data);
+
+    (grad_x, grad_w, grad_b)
+}
+
+/// Embedding lookup forward on CPU.
+#[must_use]
+pub fn embedding(x: &Tensor, weight: &Tensor) -> Tensor {
+    assert_eq!(weight.dtype(), vearo_core::DType::F32, "Weight must be F32");
+    assert_eq!(
+        weight.shape().rank(),
+        2,
+        "Weight must be rank 2 (vocab_size, embedding_dim)"
+    );
+
+    let x_data = read_f32(x);
+    let w_data = read_f32(weight);
+
+    let weight_dims = weight.shape().dims();
+    let vocab_size = weight_dims[0];
+    let embedding_dim = weight_dims[1];
+
+    let mut out_dims = x.shape().dims().to_vec();
+    out_dims.push(embedding_dim);
+    let out_shape = Shape::new(&out_dims);
+
+    let out = Tensor::zeros(out_shape, vearo_core::DType::F32);
+    if x.shape().numel() == 0 {
+        return out;
+    }
+
+    let mut out_data = vec![0.0f32; out_shape.numel()];
+
+    for i in 0..x.shape().numel() {
+        let coord = flat_to_coord(i, x.shape());
+        let off = get_offset(&coord, x.shape(), x.strides());
+
+        let token_val = x_data[off];
+        assert!(
+            token_val >= 0.0,
+            "Token ID cannot be negative: {}",
+            token_val
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let token_id = token_val.round() as usize;
+        assert!(
+            token_id < vocab_size,
+            "Token ID {} out of vocabulary bound {}",
+            token_id,
+            vocab_size
+        );
+
+        let out_base = i * embedding_dim;
+
+        for d in 0..embedding_dim {
+            let w_coord = [token_id, d];
+            let w_off = get_offset(&w_coord, weight.shape(), weight.strides());
+            out_data[out_base + d] = w_data[w_off];
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Embedding lookup backward on CPU.
+#[must_use]
+#[allow(clippy::similar_names)]
+pub fn embedding_backward(x: &Tensor, weight: &Tensor, grad_out: &Tensor) -> Tensor {
+    assert_eq!(
+        weight.shape().rank(),
+        2,
+        "Weight must be rank 2 (vocab_size, embedding_dim)"
+    );
+
+    let weight_dims = weight.shape().dims();
+    let vocab_size = weight_dims[0];
+    let embedding_dim = weight_dims[1];
+
+    let mut expected_go_dims = x.shape().dims().to_vec();
+    expected_go_dims.push(embedding_dim);
+    assert_eq!(
+        grad_out.shape().dims(),
+        expected_go_dims.as_slice(),
+        "grad_out shape must be x.shape() + [embedding_dim]"
+    );
+
+    let grad_w = Tensor::zeros(*weight.shape(), vearo_core::DType::F32);
+    let x_data = read_f32(x);
+    let go_data = read_f32(grad_out);
+
+    let mut gw_data = vec![0.0f32; weight.shape().numel()];
+
+    for i in 0..x.shape().numel() {
+        let coord = flat_to_coord(i, x.shape());
+        let off = get_offset(&coord, x.shape(), x.strides());
+
+        let token_val = x_data[off];
+        assert!(
+            token_val >= 0.0,
+            "Token ID cannot be negative: {}",
+            token_val
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let token_id = token_val.round() as usize;
+        assert!(
+            token_id < vocab_size,
+            "Token ID {} out of vocabulary bound {}",
+            token_id,
+            vocab_size
+        );
+
+        for d in 0..embedding_dim {
+            let go_coord = {
+                let mut c = coord.clone();
+                c.push(d);
+                c
+            };
+            let go_off = get_offset(&go_coord, grad_out.shape(), grad_out.strides());
+            gw_data[token_id * embedding_dim + d] += go_data[go_off];
+        }
+    }
+
+    write_f32(&grad_w, gw_data);
+    grad_w
+}
+
+/// Categorical cross-entropy loss forward on CPU.
+#[must_use]
+pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
+    assert_eq!(logits.dtype(), vearo_core::DType::F32, "Logits must be F32");
+    assert_eq!(
+        logits.shape().rank(),
+        2,
+        "Logits must be rank 2 (batch_size, vocab_size)"
+    );
+    assert_eq!(
+        targets.shape().rank(),
+        1,
+        "Targets must be rank 1 (batch_size)"
+    );
+
+    let logits_dims = logits.shape().dims();
+    let batch_size = logits_dims[0];
+    let vocab_size = logits_dims[1];
+
+    assert!(batch_size > 0, "Batch size must be greater than 0");
+    assert_eq!(
+        targets.shape()[0],
+        batch_size,
+        "Targets shape must match batch size"
+    );
+
+    let t_data = read_f32(targets);
+    let l_data = read_f32(logits);
+
+    let mut loss_sum = 0.0f32;
+
+    for b in 0..batch_size {
+        let target_val = t_data[get_offset(&[b], targets.shape(), targets.strides())];
+        assert!(
+            target_val >= 0.0,
+            "Target class cannot be negative: {}",
+            target_val
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_class = target_val.round() as usize;
+        assert!(
+            target_class < vocab_size,
+            "Target class {} out of vocab bounds {}",
+            target_class,
+            vocab_size
+        );
+
+        let mut max_logit = f32::NEG_INFINITY;
+        for c in 0..vocab_size {
+            let l_off = get_offset(&[b, c], logits.shape(), logits.strides());
+            if l_data[l_off] > max_logit {
+                max_logit = l_data[l_off];
+            }
+        }
+
+        let mut sum_exp = 0.0f32;
+        for c in 0..vocab_size {
+            let l_off = get_offset(&[b, c], logits.shape(), logits.strides());
+            sum_exp += (l_data[l_off] - max_logit).exp();
+        }
+
+        let target_off = get_offset(&[b, target_class], logits.shape(), logits.strides());
+        let target_logit = l_data[target_off];
+        let log_softmax = target_logit - max_logit - sum_exp.ln();
+        loss_sum -= log_softmax;
+    }
+
+    let mean_loss = loss_sum / (batch_size as f32);
+    Tensor::from_f32(&[mean_loss], [1])
+}
+
+/// Categorical cross-entropy loss backward on CPU.
+#[must_use]
+pub fn cross_entropy_backward(logits: &Tensor, targets: &Tensor, grad_out: &Tensor) -> Tensor {
+    assert_eq!(
+        logits.shape().rank(),
+        2,
+        "Logits must be rank 2 (batch_size, vocab_size)"
+    );
+    assert_eq!(
+        targets.shape().rank(),
+        1,
+        "Targets must be rank 1 (batch_size)"
+    );
+
+    let grad_l = Tensor::zeros(*logits.shape(), vearo_core::DType::F32);
+    let logits_dims = logits.shape().dims();
+    let batch_size = logits_dims[0];
+    let vocab_size = logits_dims[1];
+
+    assert!(batch_size > 0, "Batch size must be greater than 0");
+    assert_eq!(
+        targets.shape()[0],
+        batch_size,
+        "Targets shape must match batch size"
+    );
+    assert_eq!(grad_out.shape().numel(), 1, "grad_out must be a scalar");
+
+    let t_data = read_f32(targets);
+    let l_data = read_f32(logits);
+    let go_val = read_f32(grad_out)[0];
+
+    let mut gl_data = vec![0.0f32; logits.shape().numel()];
+
+    for b in 0..batch_size {
+        let target_val = t_data[get_offset(&[b], targets.shape(), targets.strides())];
+        assert!(
+            target_val >= 0.0,
+            "Target class cannot be negative: {}",
+            target_val
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_class = target_val.round() as usize;
+        assert!(
+            target_class < vocab_size,
+            "Target class {} out of vocab bounds {}",
+            target_class,
+            vocab_size
+        );
+
+        let mut max_logit = f32::NEG_INFINITY;
+        for c in 0..vocab_size {
+            let l_off = get_offset(&[b, c], logits.shape(), logits.strides());
+            if l_data[l_off] > max_logit {
+                max_logit = l_data[l_off];
+            }
+        }
+
+        let mut sum_exp = 0.0f32;
+        for c in 0..vocab_size {
+            let l_off = get_offset(&[b, c], logits.shape(), logits.strides());
+            sum_exp += (l_data[l_off] - max_logit).exp();
+        }
+
+        for c in 0..vocab_size {
+            let l_off = get_offset(&[b, c], logits.shape(), logits.strides());
+            let p_c = (l_data[l_off] - max_logit).exp() / sum_exp;
+            let target_indicator = if c == target_class { 1.0f32 } else { 0.0f32 };
+
+            let out_idx = b * vocab_size + c;
+            gl_data[out_idx] = go_val * (p_c - target_indicator) / (batch_size as f32);
+        }
+    }
+
+    write_f32(&grad_l, gl_data);
+    grad_l
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,7 +1036,7 @@ mod tests {
             .unwrap()
             .storage
         {
-            CpuStorage::F32(vec) => assert_eq!(vec, &vec![5.0, 7.0, 9.0]),
+            CpuStorage::F32(vec) => assert_eq!(vec.as_ref(), &vec![5.0, 7.0, 9.0]),
             _ => unreachable!(),
         }
     }
@@ -445,7 +1055,7 @@ mod tests {
             .unwrap()
             .storage
         {
-            CpuStorage::F32(vec) => assert_eq!(vec, &vec![19.0, 22.0, 43.0, 50.0]),
+            CpuStorage::F32(vec) => assert_eq!(vec.as_ref(), &vec![19.0, 22.0, 43.0, 50.0]),
             _ => unreachable!(),
         }
     }
@@ -467,7 +1077,7 @@ mod tests {
             .storage
         {
             CpuStorage::F32(vec) => assert_eq!(
-                vec,
+                vec.as_ref(),
                 &vec![
                     11.0, 12.0, 13.0, // y = 10
                     21.0, 22.0, 23.0 // y = 20
@@ -494,7 +1104,7 @@ mod tests {
             .storage
         {
             CpuStorage::F32(vec) => assert_eq!(
-                vec,
+                vec.as_ref(),
                 &vec![
                     11.0, 24.0, // x_t[0] = [1, 4] + [10, 20]
                     32.0, 45.0, // x_t[1] = [2, 5] + [30, 40]
@@ -534,7 +1144,7 @@ mod tests {
             .storage
         {
             CpuStorage::F32(vec) => assert_eq!(
-                vec,
+                vec.as_ref(),
                 &vec![
                     22.0, 28.0, 49.0, 64.0, // Batch 0 matmul
                     220.0, 244.0, 301.0, 334.0 // Batch 1 matmul
@@ -562,7 +1172,7 @@ mod tests {
             .unwrap()
             .storage
         {
-            CpuStorage::F32(vec) => assert_eq!(vec, &vec![5.0, 7.0, 9.0]),
+            CpuStorage::F32(vec) => assert_eq!(vec.as_ref(), &vec![5.0, 7.0, 9.0]),
             _ => unreachable!(),
         }
     }
@@ -570,7 +1180,7 @@ mod tests {
     #[test]
     fn test_relu() {
         let x = Tensor::from_f32(&[1.0, -2.0, 3.0, -0.5], [4]);
-        assert_eq!(read_f32(&relu(&x)), vec![1.0, 0.0, 3.0, 0.0]);
+        assert_eq!(*read_f32(&relu(&x)), vec![1.0, 0.0, 3.0, 0.0]);
     }
 
     #[test]
@@ -579,23 +1189,23 @@ mod tests {
 
         let s1 = sum(&x, 1, false); // over columns -> [6, 15]
         assert_eq!(s1.shape().dims(), &[2]);
-        assert_eq!(read_f32(&s1), vec![6.0, 15.0]);
+        assert_eq!(*read_f32(&s1), vec![6.0, 15.0]);
 
         let s0 = sum(&x, 0, false); // over rows -> [5, 7, 9]
         assert_eq!(s0.shape().dims(), &[3]);
-        assert_eq!(read_f32(&s0), vec![5.0, 7.0, 9.0]);
+        assert_eq!(*read_f32(&s0), vec![5.0, 7.0, 9.0]);
 
         let sk = sum(&x, 1, true); // keep_dim -> [2, 1]
         assert_eq!(sk.shape().dims(), &[2, 1]);
-        assert_eq!(read_f32(&sk), vec![6.0, 15.0]);
+        assert_eq!(*read_f32(&sk), vec![6.0, 15.0]);
     }
 
     #[test]
     fn test_mean_dim() {
         let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]);
 
-        assert_eq!(read_f32(&mean(&x, 1, false)), vec![2.0, 5.0]);
-        assert_eq!(read_f32(&mean(&x, 0, false)), vec![2.5, 3.5, 4.5]);
+        assert_eq!(*read_f32(&mean(&x, 1, false)), vec![2.0, 5.0]);
+        assert_eq!(*read_f32(&mean(&x, 0, false)), vec![2.5, 3.5, 4.5]);
     }
 
     #[test]
@@ -605,7 +1215,7 @@ mod tests {
         let xt = x.transpose(0, 1); // logical [3, 2] = [[1,4],[2,5],[3,6]]
         let s = sum(&xt, 1, false); // row sums -> [5, 7, 9]
         assert_eq!(s.shape().dims(), &[3]);
-        assert_eq!(read_f32(&s), vec![5.0, 7.0, 9.0]);
+        assert_eq!(*read_f32(&s), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
@@ -620,5 +1230,74 @@ mod tests {
         let z = add(&r, &y);
         assert_eq!(z.shape().dims(), &[0, 6]);
         assert_eq!(z.shape().numel(), 0);
+    }
+
+    #[test]
+    fn test_layernorm_non_contiguous_and_empty() {
+        init();
+        // 1. Empty input
+        let x_empty = Tensor::zeros([2, 0, 4], vearo_core::DType::F32);
+        let weight = Tensor::from_f32(&[1.0, 1.0, 1.0, 1.0], [4]);
+        let bias = Tensor::from_f32(&[0.0, 0.0, 0.0, 0.0], [4]);
+        let out_empty = layernorm(&x_empty, &weight, &bias, 1e-5);
+        assert_eq!(out_empty.shape().dims(), &[2, 0, 4]);
+
+        // 2. Non-contiguous input
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]);
+        let x_transposed = x.transpose(0, 1); // shape [4, 2]
+        let weight_2 = Tensor::from_f32(&[1.0, 1.0], [2]);
+        let bias_2 = Tensor::from_f32(&[0.0, 0.0], [2]);
+        let out = layernorm(&x_transposed, &weight_2, &bias_2, 1e-5);
+        assert_eq!(out.shape().dims(), &[4, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Token ID cannot be negative")]
+    fn test_embedding_negative_panic() {
+        init();
+        let x = Tensor::from_f32(&[-1.0, 0.0], [2]);
+        let weight = Tensor::zeros([2, 3], vearo_core::DType::F32);
+        let _ = embedding(&x, &weight);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of vocabulary bound")]
+    fn test_embedding_oob_panic() {
+        init();
+        let x = Tensor::from_f32(&[2.0, 0.0], [2]);
+        let weight = Tensor::zeros([2, 3], vearo_core::DType::F32);
+        let _ = embedding(&x, &weight);
+    }
+
+    #[test]
+    #[should_panic(expected = "Target class cannot be negative")]
+    fn test_cross_entropy_negative_panic() {
+        init();
+        let logits = Tensor::zeros([2, 3], vearo_core::DType::F32);
+        let targets = Tensor::from_f32(&[-1.0, 0.0], [2]);
+        let _ = cross_entropy(&logits, &targets);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of vocab bounds")]
+    fn test_cross_entropy_oob_panic() {
+        init();
+        let logits = Tensor::zeros([2, 3], vearo_core::DType::F32);
+        let targets = Tensor::from_f32(&[3.0, 0.0], [2]);
+        let _ = cross_entropy(&logits, &targets);
+    }
+
+    #[test]
+    fn test_cross_entropy_numerical_stability() {
+        init();
+        // Very large logits that would overflow if not stabilized with max subtraction.
+        // Target is class 0, which has the large logit 1000.0. Class 1 has -1000.0.
+        let logits = Tensor::from_f32(&[1000.0, -1000.0], [1, 2]);
+        let targets = Tensor::from_f32(&[0.0], [1]);
+        let loss = cross_entropy(&logits, &targets);
+        let loss_val = read_f32(&loss)[0];
+        // log(exp(1000-1000) + exp(-1000-1000)) = log(1 + exp(-2000)) ~= 0
+        // loss = - (1000 - 1000 - 0) = 0
+        assert!(loss_val.abs() < 1e-4);
     }
 }

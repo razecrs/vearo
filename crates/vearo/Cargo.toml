@@ -12,6 +12,7 @@ workspace = true
 vearo-core.workspace = true
 vearo-autograd.workspace = true
 vearo-backend-cpu.workspace = true
+vearo-backend-cuda.workspace = true
 vearo-nn.workspace = true
 vearo-optim.workspace = true
 

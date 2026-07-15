@@ -26,6 +26,7 @@ perf = "deny"
 vearo-core = { path = "crates/vearo-core" }
 vearo-autograd = { path = "crates/vearo-autograd" }
 vearo-backend-cpu = { path = "crates/vearo-backend-cpu" }
+vearo-backend-cuda = { path = "crates/vearo-backend-cuda" }
 vearo-nn = { path = "crates/vearo-nn" }
 vearo-optim = { path = "crates/vearo-optim" }
 serde = { version = "1.0", features = ["derive"] }

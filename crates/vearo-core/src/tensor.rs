@@ -19,7 +19,9 @@ pub struct Tensor {
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
-        if self.device.is_cpu() {
+        if let Some(inc) = REFCOUNT_INC.get() {
+            inc(self.storage_id, self.device);
+        } else if self.device.is_cpu() {
             get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -39,53 +41,168 @@ impl Clone for Tensor {
 
 impl Drop for Tensor {
     fn drop(&mut self) {
-        if self.device.is_cpu() {
+        let is_last = if let Some(dec) = REFCOUNT_DEC.get() {
+            dec(self.storage_id, self.device)
+        } else if self.device.is_cpu() {
             let mut shard = get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            let is_last =
-                if let Some(Some(slot)) = shard.slots.get(self.storage_id.slot_idx as usize) {
-                    slot.ref_count == 1
-                } else {
-                    false
-                };
+            let last = if let Some(Some(slot)) = shard.slots.get(self.storage_id.slot_idx as usize)
+            {
+                slot.ref_count == 1
+            } else {
+                false
+            };
 
             shard.decrement(self.storage_id.slot_idx);
-            if is_last {
-                drop(shard); // Release lock before calling drop_hook to avoid deadlocks
+            last
+        } else {
+            false
+        };
 
-                if let Some(drop_hook) = DROP_HOOK.get() {
-                    drop_hook(self.storage_id);
-                }
-            }
+        if is_last && let Some(drop_hook) = DROP_HOOK.get() {
+            drop_hook(self.storage_id);
         }
     }
 }
 
 impl Tensor {
+    /// Create a zero-filled tensor on a specific device.
+    ///
+    /// # Panics
+    /// Panics if device is not CPU or CUDA, or if CUDA hooks are not registered.
+    #[must_use]
+    pub fn zeros_on(shape: impl Into<Shape>, dtype: DType, device: Device) -> Self {
+        let shape = shape.into();
+        let numel = shape.numel();
+        let strides = shape.contiguous_strides();
+
+        let storage_id = if device.is_cpu() {
+            let shard_idx = current_thread_shard_idx();
+            get_cpu_shard(shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .alloc(numel, dtype, shard_idx)
+        } else if device.is_cuda() {
+            let alloc = CUDA_ALLOC_HOOK
+                .get()
+                .expect("CUDA alloc hook not registered");
+            alloc(numel)
+        } else {
+            panic!("Unsupported device: {device:?}");
+        };
+
+        Self {
+            storage_id,
+            shape,
+            strides,
+            dtype,
+            device,
+            node_id: std::cell::Cell::new(None),
+            requires_grad: std::cell::Cell::new(false),
+        }
+    }
+
     /// Creates a zero filled CPU tensor.
     ///
     /// # Panics
     /// Panics if the CPU Arena lock is poisoned.
     #[must_use]
     pub fn zeros(shape: impl Into<Shape>, dtype: DType) -> Self {
+        Self::zeros_on(shape, dtype, Device::Cpu)
+    }
+
+    /// Create a CUDA tensor from CPU data.
+    ///
+    /// # Panics
+    /// Panics if CUDA hooks are not registered.
+    #[must_use]
+    pub fn from_f32_cuda(data: &[f32], shape: impl Into<Shape>, device: Device) -> Self {
         let shape = shape.into();
-        let numel = shape.numel();
+        assert_eq!(data.len(), shape.numel(), "Data len must match shape numel");
         let strides = shape.contiguous_strides();
-        let shard_idx = current_thread_shard_idx();
-        let storage_id = get_cpu_shard(shard_idx as usize)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .alloc(numel, dtype, shard_idx);
+
+        let alloc = CUDA_ALLOC_HOOK
+            .get()
+            .expect("CUDA alloc hook not registered");
+        let write = CUDA_WRITE_HOOK
+            .get()
+            .expect("CUDA write hook not registered");
+
+        let storage_id = alloc(shape.numel());
+        write(storage_id, data);
+
+        Self {
+            storage_id,
+            shape,
+            strides,
+            dtype: DType::F32,
+            device,
+            node_id: std::cell::Cell::new(None),
+            requires_grad: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Create a tensor directly from components.
+    #[must_use]
+    pub const fn from_components(
+        storage_id: StorageId,
+        shape: Shape,
+        strides: Shape,
+        dtype: DType,
+        device: Device,
+    ) -> Self {
         Self {
             storage_id,
             shape,
             strides,
             dtype,
-            device: Device::Cpu,
+            device,
             node_id: std::cell::Cell::new(None),
             requires_grad: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Move tensor to a different device.
+    ///
+    /// # Panics
+    /// Panics if device is not CPU or CUDA, or if CUDA hooks are not registered.
+    #[must_use]
+    pub fn to(&self, device: Device) -> Self {
+        if self.device == device {
+            return self.clone();
+        }
+
+        let numel = self.shape().numel();
+        let data = self.to_vec_f32();
+
+        if device.is_cpu() {
+            let mut out = Self::from_f32(&data, *self.shape());
+            out.requires_grad = self.requires_grad.clone();
+            out
+        } else if device.is_cuda() {
+            let alloc = CUDA_ALLOC_HOOK
+                .get()
+                .expect("CUDA alloc hook not registered");
+            let write = CUDA_WRITE_HOOK
+                .get()
+                .expect("CUDA write hook not registered");
+
+            let storage_id = alloc(numel);
+            write(storage_id, &data);
+
+            Self {
+                storage_id,
+                shape: self.shape,
+                strides: self.strides,
+                dtype: self.dtype,
+                device,
+                node_id: std::cell::Cell::new(None),
+                requires_grad: std::cell::Cell::new(self.requires_grad.get()),
+            }
+        } else {
+            panic!("Unsupported device: {device:?}");
         }
     }
 
@@ -216,6 +333,26 @@ impl Tensor {
     pub fn contiguous(&self) -> Self {
         if self.is_contiguous() {
             return self.clone();
+        }
+        if self.device.is_cuda() {
+            let read = CUDA_READ_HOOK.get().expect("CUDA read hook not registered");
+            let raw_data = read(self.storage_id);
+            let shard_idx = current_thread_shard_idx();
+            let cpu_storage_id = get_cpu_shard(shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .alloc_raw(CpuStorage::F32(std::sync::Arc::new(raw_data)), shard_idx);
+            let cpu_view = Self {
+                storage_id: cpu_storage_id,
+                shape: self.shape,
+                strides: self.strides,
+                dtype: self.dtype,
+                device: Device::Cpu,
+                node_id: std::cell::Cell::new(None),
+                requires_grad: std::cell::Cell::new(false),
+            };
+            let cpu_contiguous = cpu_view.contiguous();
+            return cpu_contiguous.to(self.device);
         }
         if self.shape.numel() == 0 {
             return Self::zeros(self.shape, self.dtype);
@@ -350,7 +487,9 @@ impl Tensor {
         );
         let contiguous_self = self.contiguous();
         let new_strides = new_shape.contiguous_strides();
-        if contiguous_self.device.is_cpu() {
+        if let Some(inc) = REFCOUNT_INC.get() {
+            inc(contiguous_self.storage_id, contiguous_self.device);
+        } else if contiguous_self.device.is_cpu() {
             get_cpu_shard(contiguous_self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -383,7 +522,9 @@ impl Tensor {
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Self {
         let shape = self.shape.swapped(dim0, dim1);
         let strides = self.strides.swapped(dim0, dim1);
-        if self.device.is_cpu() {
+        if let Some(inc) = REFCOUNT_INC.get() {
+            inc(self.storage_id, self.device);
+        } else if self.device.is_cpu() {
             get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -442,7 +583,9 @@ impl Tensor {
         let new_shape = Shape::new(&new_dims[..rank]);
         let new_strides_shape = Shape::new(&new_strides[..rank]);
 
-        if self.device.is_cpu() {
+        if let Some(inc) = REFCOUNT_INC.get() {
+            inc(self.storage_id, self.device);
+        } else if self.device.is_cpu() {
             get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -589,18 +732,25 @@ impl Tensor {
             self.is_contiguous(),
             "to_vec_f32 requires contiguous tensor"
         );
-        let guard = get_cpu_shard(self.storage_id.shard_idx as usize)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = guard.slots[self.storage_id.slot_idx as usize]
-            .as_ref()
-            .expect("Storage slot was empty");
-        let val = match &slot.storage {
-            CpuStorage::F32(vec) => vec.as_ref().clone(),
-            _ => panic!("Expected F32 storage"),
-        };
-        drop(guard);
-        val
+        if self.device.is_cpu() {
+            let guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = guard.slots[self.storage_id.slot_idx as usize]
+                .as_ref()
+                .expect("Storage slot was empty");
+            let val = match &slot.storage {
+                CpuStorage::F32(vec) => vec.as_ref().clone(),
+                _ => panic!("Expected F32 storage"),
+            };
+            drop(guard);
+            val
+        } else if self.device.is_cuda() {
+            let read = CUDA_READ_HOOK.get().expect("CUDA read hook not registered");
+            read(self.storage_id)
+        } else {
+            panic!("Unsupported device: {:?}", self.device);
+        }
     }
 
     /// Modify a value at a flat index in the storage of a contiguous F32 tensor.
@@ -609,21 +759,33 @@ impl Tensor {
     /// Panics if the tensor is non-contiguous, not F32, or index is out of bounds.
     pub fn set_f32(&self, index: usize, value: f32) {
         assert!(self.is_contiguous(), "set_f32 requires contiguous tensor");
-        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = guard.slots[self.storage_id.slot_idx as usize]
-            .as_mut()
-            .unwrap();
-        match &mut slot.storage {
-            CpuStorage::F32(vec) => {
-                let vec_mut = std::sync::Arc::make_mut(vec);
-                assert!(index < vec_mut.len(), "Index out of bounds");
-                vec_mut[index] = value;
+        if self.device.is_cpu() {
+            let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = guard.slots[self.storage_id.slot_idx as usize]
+                .as_mut()
+                .unwrap();
+            match &mut slot.storage {
+                CpuStorage::F32(vec) => {
+                    let vec_mut = std::sync::Arc::make_mut(vec);
+                    assert!(index < vec_mut.len(), "Index out of bounds");
+                    vec_mut[index] = value;
+                }
+                _ => panic!("Expected F32 storage"),
             }
-            _ => panic!("Expected F32 storage"),
+            drop(guard);
+        } else if self.device.is_cuda() {
+            let mut data = self.to_vec_f32();
+            assert!(index < data.len(), "Index out of bounds");
+            data[index] = value;
+            let write = CUDA_WRITE_HOOK
+                .get()
+                .expect("CUDA write hook not registered");
+            write(self.storage_id, &data);
+        } else {
+            panic!("Unsupported device: {:?}", self.device);
         }
-        drop(guard);
     }
 
     /// In-place scaled addition: `self += scale * other`.
@@ -651,35 +813,47 @@ impl Tensor {
             "add_assign_scaled other must be F32"
         );
 
-        // 1. Read other's data by locking its shard briefly to clone its Arc
-        let other_data = {
-            let guard = get_cpu_shard(other.storage_id.shard_idx as usize)
+        if self.device.is_cpu() {
+            let other_data = {
+                let guard = get_cpu_shard(other.storage_id.shard_idx as usize)
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let slot = guard.slots[other.storage_id.slot_idx as usize]
+                    .as_ref()
+                    .expect("Other slot was empty");
+                match &slot.storage {
+                    CpuStorage::F32(vec) => vec.clone(),
+                    _ => panic!("Expected F32 storage for other"),
+                }
+            };
+
+            let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let slot = guard.slots[other.storage_id.slot_idx as usize]
-                .as_ref()
-                .expect("Other slot was empty");
-            match &slot.storage {
-                CpuStorage::F32(vec) => vec.clone(),
-                _ => panic!("Expected F32 storage for other"),
-            }
-        };
-
-        // 2. Lock self's shard mutably and perform the scaled addition
-        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = guard.slots[self.storage_id.slot_idx as usize]
-            .as_mut()
-            .expect("Self slot was empty");
-        match &mut slot.storage {
-            CpuStorage::F32(vec) => {
-                let vec_mut = std::sync::Arc::make_mut(vec);
-                for (dest, &src) in vec_mut.iter_mut().zip(other_data.iter()) {
-                    *dest += scale * src;
+            let slot = guard.slots[self.storage_id.slot_idx as usize]
+                .as_mut()
+                .expect("Self slot was empty");
+            match &mut slot.storage {
+                CpuStorage::F32(vec) => {
+                    let vec_mut = std::sync::Arc::make_mut(vec);
+                    for (dest, &src) in vec_mut.iter_mut().zip(other_data.iter()) {
+                        *dest += scale * src;
+                    }
                 }
+                _ => panic!("Expected F32 storage for self"),
             }
-            _ => panic!("Expected F32 storage for self"),
+        } else if self.device.is_cuda() {
+            let mut self_data = self.to_vec_f32();
+            let other_data = other.to_vec_f32();
+            for (dest, &src) in self_data.iter_mut().zip(other_data.iter()) {
+                *dest += scale * src;
+            }
+            let write = CUDA_WRITE_HOOK
+                .get()
+                .expect("CUDA write hook not registered");
+            write(self.storage_id, &self_data);
+        } else {
+            panic!("Unsupported device: {:?}", self.device);
         }
     }
 
@@ -711,60 +885,79 @@ impl Tensor {
         assert_eq!(self.dtype, DType::F32, "adamw_step self must be F32");
         assert_eq!(grad.dtype, DType::F32, "adamw_step grad must be F32");
 
-        // 1. Read grad's data by locking its shard briefly to clone its Arc
-        let grad_data = {
-            let guard = get_cpu_shard(grad.storage_id.shard_idx as usize)
+        let grad_data = grad.to_vec_f32();
+
+        if self.device.is_cpu() {
+            let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let slot = guard.slots[grad.storage_id.slot_idx as usize]
-                .as_ref()
-                .expect("Grad slot was empty");
-            match &slot.storage {
-                CpuStorage::F32(vec) => vec.clone(),
-                _ => panic!("Expected F32 storage for grad"),
-            }
-        };
+            let slot = guard.slots[self.storage_id.slot_idx as usize]
+                .as_mut()
+                .expect("Self slot was empty");
+            match &mut slot.storage {
+                CpuStorage::F32(vec) => {
+                    let vec_mut = std::sync::Arc::make_mut(vec);
+                    assert_eq!(
+                        vec_mut.len(),
+                        m.len(),
+                        "Momentum vector m must match parameter length"
+                    );
+                    assert_eq!(
+                        vec_mut.len(),
+                        v.len(),
+                        "Variance vector v must match parameter length"
+                    );
 
-        // 2. Lock self's shard mutably and perform the AdamW step elementwise
-        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = guard.slots[self.storage_id.slot_idx as usize]
-            .as_mut()
-            .expect("Self slot was empty");
-        match &mut slot.storage {
-            CpuStorage::F32(vec) => {
-                let vec_mut = std::sync::Arc::make_mut(vec);
-                assert_eq!(
-                    vec_mut.len(),
-                    m.len(),
-                    "Momentum vector m must match parameter length"
-                );
-                assert_eq!(
-                    vec_mut.len(),
-                    v.len(),
-                    "Variance vector v must match parameter length"
-                );
+                    let bias_correction1 = 1.0 - beta1.powi(i32::try_from(t).unwrap());
+                    let bias_correction2 = 1.0 - beta2.powi(i32::try_from(t).unwrap());
 
-                let bias_correction1 = 1.0 - beta1.powi(i32::try_from(t).unwrap());
-                let bias_correction2 = 1.0 - beta2.powi(i32::try_from(t).unwrap());
+                    for i in 0..vec_mut.len() {
+                        let g_i = grad_data[i];
+                        m[i] = beta1 * m[i] + (1.0 - beta1) * g_i;
+                        v[i] = beta2 * v[i] + (1.0 - beta2) * g_i * g_i;
 
-                for i in 0..vec_mut.len() {
-                    let g_i = grad_data[i];
-                    m[i] = beta1 * m[i] + (1.0 - beta1) * g_i;
-                    v[i] = beta2 * v[i] + (1.0 - beta2) * g_i * g_i;
+                        let m_hat = m[i] / bias_correction1;
+                        let v_hat = v[i] / bias_correction2;
 
-                    let m_hat = m[i] / bias_correction1;
-                    let v_hat = v[i] / bias_correction2;
-
-                    // Decoupled weight decay: p = p - lr * weight_decay * p
-                    vec_mut[i] -= lr * weight_decay * vec_mut[i];
-
-                    // Adam update: p = p - lr * m_hat / (sqrt(v_hat) + epsilon)
-                    vec_mut[i] -= lr * m_hat / (v_hat.sqrt() + epsilon);
+                        vec_mut[i] -= lr * weight_decay * vec_mut[i];
+                        vec_mut[i] -= lr * m_hat / (v_hat.sqrt() + epsilon);
+                    }
                 }
+                _ => panic!("Expected F32 storage for self"),
             }
-            _ => panic!("Expected F32 storage for self"),
+        } else if self.device.is_cuda() {
+            let mut self_data = self.to_vec_f32();
+            assert_eq!(
+                self_data.len(),
+                m.len(),
+                "Momentum vector m must match parameter length"
+            );
+            assert_eq!(
+                self_data.len(),
+                v.len(),
+                "Variance vector v must match parameter length"
+            );
+
+            let bias_correction1 = 1.0 - beta1.powi(i32::try_from(t).unwrap());
+            let bias_correction2 = 1.0 - beta2.powi(i32::try_from(t).unwrap());
+
+            for i in 0..self_data.len() {
+                let g_i = grad_data[i];
+                m[i] = beta1 * m[i] + (1.0 - beta1) * g_i;
+                v[i] = beta2 * v[i] + (1.0 - beta2) * g_i * g_i;
+
+                let m_hat = m[i] / bias_correction1;
+                let v_hat = v[i] / bias_correction2;
+
+                self_data[i] -= lr * weight_decay * self_data[i];
+                self_data[i] -= lr * m_hat / (v_hat.sqrt() + epsilon);
+            }
+            let write = CUDA_WRITE_HOOK
+                .get()
+                .expect("CUDA write hook not registered");
+            write(self.storage_id, &self_data);
+        } else {
+            panic!("Unsupported device: {:?}", self.device);
         }
     }
 
@@ -787,46 +980,57 @@ impl Tensor {
         assert_eq!(self.dtype, DType::F32, "sgd_step self must be F32");
         assert_eq!(grad.dtype, DType::F32, "sgd_step grad must be F32");
 
-        // 1. Read grad's data by locking its shard briefly to clone its Arc
-        let grad_data = {
-            let guard = get_cpu_shard(grad.storage_id.shard_idx as usize)
+        let grad_data = grad.to_vec_f32();
+
+        if self.device.is_cpu() {
+            let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let slot = guard.slots[grad.storage_id.slot_idx as usize]
-                .as_ref()
-                .expect("Grad slot was empty");
-            match &slot.storage {
-                CpuStorage::F32(vec) => vec.clone(),
-                _ => panic!("Expected F32 storage for grad"),
-            }
-        };
+            let slot = guard.slots[self.storage_id.slot_idx as usize]
+                .as_mut()
+                .expect("Self slot was empty");
+            match &mut slot.storage {
+                CpuStorage::F32(vec) => {
+                    let vec_mut = std::sync::Arc::make_mut(vec);
+                    assert_eq!(
+                        vec_mut.len(),
+                        velocity.len(),
+                        "Velocity vector must match parameter length"
+                    );
 
-        // 2. Lock self's shard mutably and perform the SGD step elementwise
-        let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = guard.slots[self.storage_id.slot_idx as usize]
-            .as_mut()
-            .expect("Self slot was empty");
-        match &mut slot.storage {
-            CpuStorage::F32(vec) => {
-                let vec_mut = std::sync::Arc::make_mut(vec);
-                assert_eq!(
-                    vec_mut.len(),
-                    velocity.len(),
-                    "Velocity vector must match parameter length"
-                );
-
-                for i in 0..vec_mut.len() {
-                    let mut g_i = grad_data[i];
-                    if weight_decay != 0.0 {
-                        g_i += weight_decay * vec_mut[i];
+                    for i in 0..vec_mut.len() {
+                        let mut g_i = grad_data[i];
+                        if weight_decay != 0.0 {
+                            g_i += weight_decay * vec_mut[i];
+                        }
+                        velocity[i] = momentum * velocity[i] + g_i;
+                        vec_mut[i] -= lr * velocity[i];
                     }
-                    velocity[i] = momentum * velocity[i] + g_i;
-                    vec_mut[i] -= lr * velocity[i];
                 }
+                _ => panic!("Expected F32 storage for self"),
             }
-            _ => panic!("Expected F32 storage for self"),
+        } else if self.device.is_cuda() {
+            let mut self_data = self.to_vec_f32();
+            assert_eq!(
+                self_data.len(),
+                velocity.len(),
+                "Velocity vector must match parameter length"
+            );
+
+            for i in 0..self_data.len() {
+                let mut g_i = grad_data[i];
+                if weight_decay != 0.0 {
+                    g_i += weight_decay * self_data[i];
+                }
+                velocity[i] = momentum * velocity[i] + g_i;
+                self_data[i] -= lr * velocity[i];
+            }
+            let write = CUDA_WRITE_HOOK
+                .get()
+                .expect("CUDA write hook not registered");
+            write(self.storage_id, &self_data);
+        } else {
+            panic!("Unsupported device: {:?}", self.device);
         }
     }
 }
@@ -876,6 +1080,10 @@ pub struct BackendOps {
     pub cross_entropy: fn(&Tensor, &Tensor) -> Tensor,
     /// Categorical cross-entropy loss backward function.
     pub cross_entropy_backward: fn(&Tensor, &Tensor, &Tensor) -> Tensor,
+    /// Two-dimensional convolution (input, weight, bias, stride, padding).
+    pub conv2d: fn(&Tensor, &Tensor, &Tensor, usize, usize) -> Tensor,
+    /// Backward for the convolution: returns (grad input, grad weight, grad bias).
+    pub conv2d_backward: fn(&Tensor, &Tensor, &Tensor, usize, usize) -> (Tensor, Tensor, Tensor),
 }
 
 /// Per-backend registry of op implementations, indexed by [`Device::backend_idx`].
@@ -948,6 +1156,43 @@ pub static DROP_HOOK: std::sync::OnceLock<fn(StorageId)> = std::sync::OnceLock::
 /// Registers the autograd drop cleanup hook.
 pub fn register_drop_hook(f: fn(StorageId)) {
     let _ = DROP_HOOK.set(f);
+}
+
+/// Hook for incrementing reference count of a tensor's storage.
+pub static REFCOUNT_INC: std::sync::OnceLock<fn(StorageId, Device)> = std::sync::OnceLock::new();
+
+/// Registers the refcount increment hook.
+pub fn register_refcount_inc(f: fn(StorageId, Device)) {
+    let _ = REFCOUNT_INC.set(f);
+}
+
+/// Hook for decrementing reference count of a tensor's storage. Returns true if freed.
+pub static REFCOUNT_DEC: std::sync::OnceLock<fn(StorageId, Device) -> bool> =
+    std::sync::OnceLock::new();
+
+/// Registers the refcount decrement hook.
+pub fn register_refcount_dec(f: fn(StorageId, Device) -> bool) {
+    let _ = REFCOUNT_DEC.set(f);
+}
+
+/// Hook for reading CUDA device memory.
+pub static CUDA_READ_HOOK: std::sync::OnceLock<fn(StorageId) -> Vec<f32>> =
+    std::sync::OnceLock::new();
+/// Hook for writing CUDA device memory.
+pub static CUDA_WRITE_HOOK: std::sync::OnceLock<fn(StorageId, &[f32])> = std::sync::OnceLock::new();
+/// Hook for allocating CUDA device memory.
+pub static CUDA_ALLOC_HOOK: std::sync::OnceLock<fn(usize) -> StorageId> =
+    std::sync::OnceLock::new();
+
+/// Registers the CUDA hooks.
+pub fn register_cuda_hooks(
+    read: fn(StorageId) -> Vec<f32>,
+    write: fn(StorageId, &[f32]),
+    alloc: fn(usize) -> StorageId,
+) {
+    let _ = CUDA_READ_HOOK.set(read);
+    let _ = CUDA_WRITE_HOOK.set(write);
+    let _ = CUDA_ALLOC_HOOK.set(alloc);
 }
 
 impl Tensor {
@@ -1299,6 +1544,51 @@ impl Tensor {
             .get()
             .expect("No backend registered for this device. Did you call the backend's init()?");
         (ops.cross_entropy_backward)(self, targets, grad_out)
+    }
+
+    /// Two-dimensional convolution (self=input, plus weight, bias, stride, padding).
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn conv2d(&self, weight: &Self, bias: &Self, stride: usize, padding: usize) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.conv2d)(self, weight, bias, stride, padding);
+
+        if is_autograd_enabled()
+            && (self.requires_grad() || weight.requires_grad() || bias.requires_grad())
+        {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record(
+                    &format!("conv2d_{stride}_{padding}"),
+                    &[self, weight, bias],
+                    &mut out,
+                );
+            }
+        }
+
+        out
+    }
+
+    /// Backward for the convolution: returns (grad input, grad weight, grad bias).
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn conv2d_backward(
+        &self,
+        weight: &Self,
+        grad_out: &Self,
+        stride: usize,
+        padding: usize,
+    ) -> (Self, Self, Self) {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.conv2d_backward)(self, weight, grad_out, stride, padding)
     }
 }
 

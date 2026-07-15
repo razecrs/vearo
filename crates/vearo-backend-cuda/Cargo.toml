@@ -1,0 +1,16 @@
+[package]
+name = "vearo-backend-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA GPU backend for Vearo using cudarc."
+
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+vearo-core = { path = "../vearo-core" }
+cudarc = { version = "0.11.0", features = ["cublas", "nvrtc", "driver", "cuda-version-from-build-system"] }
+
+[dev-dependencies]
+vearo-backend-cpu = { path = "../vearo-backend-cpu" }

@@ -37,6 +37,8 @@ pub fn init() {
             embedding_backward,
             cross_entropy,
             cross_entropy_backward,
+            conv2d,
+            conv2d_backward,
         },
     );
 }
@@ -1018,6 +1020,157 @@ pub fn cross_entropy_backward(logits: &Tensor, targets: &Tensor, grad_out: &Tens
     grad_l
 }
 
+/// 2D convolution on CPU (direct, naive). NCHW input, OIHW weight, per-channel bias.
+///
+/// # Panics
+/// Panics if dtypes are not F32 or shapes are invalid for the given stride/padding.
+#[must_use]
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+pub fn conv2d(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    assert_eq!(
+        input.dtype(),
+        vearo_core::DType::F32,
+        "conv2d input must be F32"
+    );
+    let ic = input.contiguous();
+    let wc = weight.contiguous();
+    let bc = bias.contiguous();
+    let id = ic.shape().dims();
+    let wd = wc.shape().dims();
+    let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
+    let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
+    assert_eq!(wd[1], cin, "conv2d channel mismatch");
+    assert!(
+        h + 2 * padding >= kh && w + 2 * padding >= kw,
+        "conv2d kernel bigger than padded input"
+    );
+
+    let oh = (h + 2 * padding - kh) / stride + 1;
+    let ow = (w + 2 * padding - kw) / stride + 1;
+    let out_shape = Shape::new([n, cout, oh, ow]);
+    let out = Tensor::zeros(out_shape, vearo_core::DType::F32);
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let x = read_f32(&ic);
+    let wt = read_f32(&wc);
+    let b = read_f32(&bc);
+    let mut out_data = vec![0.0f32; out_shape.numel()];
+
+    for nn in 0..n {
+        for co in 0..cout {
+            for y in 0..oh {
+                for x_out in 0..ow {
+                    let mut acc = b[co];
+                    for c in 0..cin {
+                        for i in 0..kh {
+                            let ih = y * stride + i;
+                            if ih < padding || ih >= h + padding {
+                                continue;
+                            }
+                            let ih = ih - padding;
+                            for j in 0..kw {
+                                let iw = x_out * stride + j;
+                                if iw < padding || iw >= w + padding {
+                                    continue;
+                                }
+                                let iw = iw - padding;
+                                let x_idx = ((nn * cin + c) * h + ih) * w + iw;
+                                let w_idx = ((co * cin + c) * kh + i) * kw + j;
+                                acc = x[x_idx].mul_add(wt[w_idx], acc);
+                            }
+                        }
+                    }
+                    out_data[((nn * cout + co) * oh + y) * ow + x_out] = acc;
+                }
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Backward for [`conv2d`]: returns `(grad_input, grad_weight, grad_bias)`.
+///
+/// # Panics
+/// Panics if dtypes are not F32.
+#[must_use]
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+pub fn conv2d_backward(
+    input: &Tensor,
+    weight: &Tensor,
+    grad_out: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> (Tensor, Tensor, Tensor) {
+    let ic = input.contiguous();
+    let wc = weight.contiguous();
+    let gc = grad_out.contiguous();
+    let id = ic.shape().dims();
+    let wd = wc.shape().dims();
+    let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
+    let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
+    let gd = gc.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let x = read_f32(&ic);
+    let wt = read_f32(&wc);
+    let go = read_f32(&gc);
+
+    let mut gi = vec![0.0f32; ic.shape().numel()];
+    let mut gw = vec![0.0f32; wc.shape().numel()];
+    let mut gb = vec![0.0f32; cout];
+
+    for nn in 0..n {
+        for co in 0..cout {
+            for y in 0..oh {
+                for x_out in 0..ow {
+                    let g = go[((nn * cout + co) * oh + y) * ow + x_out];
+                    gb[co] += g;
+                    for c in 0..cin {
+                        for i in 0..kh {
+                            let ih = y * stride + i;
+                            if ih < padding || ih >= h + padding {
+                                continue;
+                            }
+                            let ih = ih - padding;
+                            for j in 0..kw {
+                                let iw = x_out * stride + j;
+                                if iw < padding || iw >= w + padding {
+                                    continue;
+                                }
+                                let iw = iw - padding;
+                                let x_idx = ((nn * cin + c) * h + ih) * w + iw;
+                                let w_idx = ((co * cin + c) * kh + i) * kw + j;
+                                gw[w_idx] = g.mul_add(x[x_idx], gw[w_idx]);
+                                gi[x_idx] = g.mul_add(wt[w_idx], gi[x_idx]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        Tensor::from_f32(&gi, *ic.shape()),
+        Tensor::from_f32(&gw, *wc.shape()),
+        Tensor::from_f32(&gb, [cout]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,5 +1452,19 @@ mod tests {
         // log(exp(1000-1000) + exp(-1000-1000)) = log(1 + exp(-2000)) ~= 0
         // loss = - (1000 - 1000 - 0) = 0
         assert!(loss_val.abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_conv2d_forward() {
+        // input [1,1,3,3] = 1..9, weight [1,1,2,2] = [[1,0],[0,1]] (picks corners),
+        // bias 0, stride 1, padding 0 -> out [1,1,2,2].
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], [1, 1, 3, 3]);
+        let weight = Tensor::from_f32(&[1.0, 0.0, 0.0, 1.0], [1, 1, 2, 2]);
+        let bias = Tensor::from_f32(&[0.0], [1]);
+
+        let out = conv2d(&x, &weight, &bias, 1, 0);
+        assert_eq!(out.shape().dims(), &[1, 1, 2, 2]);
+        // out[i,j] = in[i,j] + in[i+1,j+1]: 1+5, 2+6, 4+8, 5+9
+        assert_eq!(read_f32(&out).to_vec(), vec![6.0, 8.0, 12.0, 14.0]);
     }
 }

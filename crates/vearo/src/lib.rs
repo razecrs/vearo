@@ -6,6 +6,8 @@
 pub use vearo_autograd as autograd;
 /// CPU execution backend.
 pub use vearo_backend_cpu as backend_cpu;
+/// CUDA execution backend.
+pub use vearo_backend_cuda as backend_cuda;
 /// Core vocabulary and types.
 pub use vearo_core as core;
 /// Neural network layers and modules.
@@ -16,11 +18,12 @@ pub use vearo_optim as optim;
 // Hoisted primitives for convenience.
 pub use vearo_core::{DType, Device, Shape, Tensor};
 
-/// Initializes the backend and autograd engine. Registers the CPU reference backend.
+/// Initializes the backend and autograd engine. Registers both CPU and CUDA backends.
 ///
 /// Idempotent - safe to call more than once.
 pub fn init() {
     vearo_backend_cpu::init();
+    vearo_backend_cuda::init();
     vearo_autograd::init();
 }
 

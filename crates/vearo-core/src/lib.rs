@@ -18,8 +18,8 @@ pub use storage::{
 };
 pub use tensor::{
     BackendOps, BackwardFn, GradFn, RecordOpFn, Tensor, is_autograd_enabled, register_backend_ops,
-    register_backward_hook, register_drop_hook, register_grad_hook, register_record_op,
-    set_autograd_enabled,
+    register_backward_hook, register_cuda_hooks, register_drop_hook, register_grad_hook,
+    register_record_op, register_refcount_dec, register_refcount_inc, set_autograd_enabled,
 };
 
 #[cfg(test)]

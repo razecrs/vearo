@@ -105,6 +105,14 @@ impl Linear {
             bias: bias_tensor,
         }
     }
+
+    /// Move the layer parameters to a different device.
+    #[must_use]
+    pub fn to(&self, device: vearo_core::Device) -> Self {
+        let weight = self.weight.to(device);
+        let bias = self.bias.as_ref().map(|b| b.to(device));
+        Self { weight, bias }
+    }
 }
 
 impl Module for Linear {
@@ -116,6 +124,99 @@ impl Module for Linear {
         } else {
             out
         }
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = vec![self.weight.clone()];
+        if let Some(ref bias) = self.bias {
+            params.push(bias.clone());
+        }
+        params
+    }
+}
+
+/// A 2D convolution layer (NCHW input, OIHW weight).
+pub struct Conv2d {
+    weight: Tensor,
+    bias: Option<Tensor>,
+    stride: usize,
+    padding: usize,
+}
+
+impl Conv2d {
+    /// Creates a new `Conv2d` layer.
+    ///
+    /// Weights use a uniform init in `[-bound, bound]` with
+    /// `bound = 1/sqrt(in_channels * kernel * kernel)` (PyTorch's default).
+    ///
+    /// # Panics
+    /// Panics if `in_channels` or `kernel` is 0.
+    #[must_use]
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+        bias: bool,
+        seed: u64,
+    ) -> Self {
+        assert!(
+            in_channels > 0 && kernel > 0,
+            "in_channels and kernel must be > 0"
+        );
+        let mut rng = SimpleRng::new(seed);
+        let fan_in = in_channels * kernel * kernel;
+        let bound = 1.0 / (fan_in as f32).sqrt();
+
+        let mut w_data = vec![0.0; out_channels * fan_in];
+        for val in &mut w_data {
+            *val = rng.next_uniform(-bound, bound);
+        }
+        let weight = Tensor::from_f32(&w_data, [out_channels, in_channels, kernel, kernel]);
+        weight.set_requires_grad(true);
+
+        let bias_tensor = if bias {
+            let mut b_data = vec![0.0; out_channels];
+            for val in &mut b_data {
+                *val = rng.next_uniform(-bound, bound);
+            }
+            let b = Tensor::from_f32(&b_data, [out_channels]);
+            b.set_requires_grad(true);
+            Some(b)
+        } else {
+            None
+        };
+
+        Self {
+            weight,
+            bias: bias_tensor,
+            stride,
+            padding,
+        }
+    }
+
+    /// Move the layer parameters to a different device.
+    #[must_use]
+    pub fn to(&self, device: vearo_core::Device) -> Self {
+        Self {
+            weight: self.weight.to(device),
+            bias: self.bias.as_ref().map(|b| b.to(device)),
+            stride: self.stride,
+            padding: self.padding,
+        }
+    }
+}
+
+impl Module for Conv2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let out_c = self.weight.shape().dims()[0];
+        let bias = self
+            .bias
+            .clone()
+            .unwrap_or_else(|| Tensor::zeros([out_c], vearo_core::DType::F32));
+        input.conv2d(&self.weight, &bias, self.stride, self.padding)
     }
 
     fn parameters(&self) -> Vec<Tensor> {

@@ -69,6 +69,13 @@ pub enum OpType {
         /// Whether the reduced axis was kept as size 1.
         keep_dim: bool,
     },
+    /// Two-dimensional convolution.
+    Conv2d {
+        /// Convolution stride.
+        stride: usize,
+        /// Zero-padding applied to each spatial side.
+        padding: usize,
+    },
 }
 
 /// A node in the autograd computation graph.
@@ -198,6 +205,11 @@ fn record_op_callback(op_name: &str, inputs: &[&Tensor], output: &mut Tensor) {
     } else if let Some(stripped) = op_name.strip_prefix("mean_") {
         let (dim, keep_dim) = parse_reduce_args(stripped);
         OpType::Mean { dim, keep_dim }
+    } else if let Some(stripped) = op_name.strip_prefix("conv2d_") {
+        let parts: Vec<&str> = stripped.split('_').collect();
+        let stride = parts[0].parse::<usize>().unwrap();
+        let padding = parts[1].parse::<usize>().unwrap();
+        OpType::Conv2d { stride, padding }
     } else {
         match op_name {
             "add" => OpType::Add,
@@ -228,7 +240,7 @@ fn reduce_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
         return grad.clone();
     }
     if grad.shape().numel() == 0 {
-        return Tensor::zeros(target_shape, grad.dtype());
+        return Tensor::zeros_on(target_shape, grad.dtype(), grad.device());
     }
     let out_numel = target_shape.iter().product::<usize>();
     let mut out_data = vec![0.0; out_numel];
@@ -267,7 +279,7 @@ fn reduce_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
         }
     }
 
-    Tensor::from_f32(&out_data, target_shape)
+    Tensor::from_f32(&out_data, target_shape).to(grad.device())
 }
 
 /// Builds the `ReLU` gradient mask: 1.0 where `x > 0`, else 0.0.
@@ -280,7 +292,7 @@ fn relu_grad_mask(x: &Tensor) -> Tensor {
             *d = 1.0;
         }
     }
-    Tensor::from_f32(&data, *xc.shape())
+    Tensor::from_f32(&data, *xc.shape()).to(x.device())
 }
 
 /// Builds the `GELU` gradient mask (derivative of GELU tanh approximation).
@@ -309,7 +321,7 @@ fn gelu_grad_mask(x: &Tensor) -> Tensor {
 
         data[i] = 0.5 * (1.0 + t) + 0.5 * v * sech_sq * inner_deriv;
     }
-    Tensor::from_f32(&data, *xc.shape())
+    Tensor::from_f32(&data, *xc.shape()).to(x.device())
 }
 
 /// Broadcasts a single-axis reduction's output gradient back to the input shape.
@@ -330,7 +342,7 @@ fn expand_reduce_grad(
         dims.insert(dim, 1);
         grad_out.reshape(Shape::new(&dims))
     };
-    let zeros = Tensor::zeros(*input_shape, DType::F32);
+    let zeros = Tensor::zeros_on(*input_shape, DType::F32, grad_out.device());
     zeros.add(&grad_keep)
 }
 
@@ -353,7 +365,7 @@ fn backward_callback(output: &Tensor) {
     let mut grad_map: HashMap<u32, Tensor> = HashMap::new();
 
     // 3. Initialize output gradient to ones
-    let out_grad = Tensor::from_f32(&[1.0], *output.shape());
+    let out_grad = Tensor::from_f32(&[1.0], *output.shape()).to(output.device());
     grad_map.insert(output_idx, out_grad);
 
     // 4. Backward execution through reverse topological sort (simply reverse tape order)
@@ -383,7 +395,7 @@ fn backward_callback(output: &Tensor) {
                 let lhs = &node.saved_tensors[0];
                 let rhs = &node.saved_tensors[1];
                 let gl = grad_out.clone();
-                let neg_ones = Tensor::from_f32(&[-1.0], [1]);
+                let neg_ones = Tensor::from_f32(&[-1.0], [1]).to(grad_out.device());
                 let gr = grad_out.mul(&neg_ones);
                 vec![
                     reduce_to(&gl, lhs.shape().dims()),
@@ -404,7 +416,7 @@ fn backward_callback(output: &Tensor) {
                 let lhs = &node.saved_tensors[0];
                 let rhs = &node.saved_tensors[1];
                 let gl = grad_out.div(rhs);
-                let neg_ones = Tensor::from_f32(&[-1.0], [1]);
+                let neg_ones = Tensor::from_f32(&[-1.0], [1]).to(grad_out.device());
                 let gr = grad_out.mul(&neg_ones).mul(lhs).div(&rhs.mul(rhs));
                 vec![
                     reduce_to(&gl, lhs.shape().dims()),
@@ -483,6 +495,12 @@ fn backward_callback(output: &Tensor) {
                 let gl = logits.cross_entropy_backward(targets, &grad_out);
                 vec![gl, Tensor::zeros(*targets.shape(), vearo_core::DType::F32)]
             }
+            OpType::Conv2d { stride, padding } => {
+                let input = &node.saved_tensors[0];
+                let weight = &node.saved_tensors[1];
+                let (gi, gw, gb) = input.conv2d_backward(weight, &grad_out, *stride, *padding);
+                vec![gi, gw, gb]
+            }
             OpType::Sum { dim, keep_dim } => {
                 let x = &node.saved_tensors[0];
                 vec![expand_reduce_grad(&grad_out, x.shape(), *dim, *keep_dim)]
@@ -492,7 +510,7 @@ fn backward_callback(output: &Tensor) {
                 let expanded = expand_reduce_grad(&grad_out, x.shape(), *dim, *keep_dim);
                 #[allow(clippy::cast_precision_loss)]
                 let count = x.shape().dims()[*dim] as f32;
-                let scale = Tensor::from_f32(&[1.0 / count], [1]);
+                let scale = Tensor::from_f32(&[1.0 / count], [1]).to(expanded.device());
                 vec![expanded.mul(&scale)]
             }
         };
@@ -634,7 +652,7 @@ where
 
     set_autograd_enabled(was_enabled);
 
-    Tensor::from_f32(&grad_data, *x_contiguous.shape())
+    Tensor::from_f32(&grad_data, *x_contiguous.shape()).to(x.device())
 }
 
 #[cfg(test)]
@@ -1139,5 +1157,52 @@ mod tests {
             t.grad().is_none(),
             "Stale gradient bug detected! Reused tensor got old gradient."
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::many_single_char_names,
+        clippy::suboptimal_flops
+    )]
+    fn test_autograd_conv2d() {
+        vearo_backend_cpu::init();
+        init();
+
+        // N=1, Cin=2, H=4, W=4, Cout=3, K=3, stride=1, padding=1 -> out [1,3,4,4].
+        let (n, cin, h, w, cout, k) = (1usize, 2usize, 4usize, 4usize, 3usize, 3usize);
+        let x_data: Vec<f32> = (0..n * cin * h * w).map(|i| i as f32 * 0.1 - 1.0).collect();
+        let w_data: Vec<f32> = (0..cout * cin * k * k)
+            .map(|i| i as f32 * 0.05 - 0.3)
+            .collect();
+        let b_data: Vec<f32> = (0..cout).map(|i| i as f32 * 0.1).collect();
+
+        let x = Tensor::from_f32(&x_data, [n, cin, h, w]);
+        let weight = Tensor::from_f32(&w_data, [cout, cin, k, k]);
+        let bias = Tensor::from_f32(&b_data, [cout]);
+        x.set_requires_grad(true);
+
+        let forward = |t: &Tensor| {
+            let out = t.conv2d(&weight, &bias, 1, 1);
+            let flat = out.shape().numel();
+            out.reshape([flat]).sum(0, false)
+        };
+
+        let out = forward(&x);
+        out.backward();
+        let ana = x.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let num = numerical_grad(forward, &x, 1e-3);
+
+        for i in 0..n * cin * h * w {
+            assert!(
+                (ana.get_f32(i) - num.get_f32(i)).abs() <= 5e-2,
+                "conv2d grad mismatch at {}: ana={}, num={}",
+                i,
+                ana.get_f32(i),
+                num.get_f32(i)
+            );
+        }
     }
 }

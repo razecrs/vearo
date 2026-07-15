@@ -1084,6 +1084,10 @@ pub struct BackendOps {
     pub conv2d: fn(&Tensor, &Tensor, &Tensor, usize, usize) -> Tensor,
     /// Backward for the convolution: returns (grad input, grad weight, grad bias).
     pub conv2d_backward: fn(&Tensor, &Tensor, &Tensor, usize, usize) -> (Tensor, Tensor, Tensor),
+    /// Two-dimensional max pooling (input, window, stride, padding).
+    pub maxpool2d: fn(&Tensor, usize, usize, usize) -> Tensor,
+    /// Backward for max pooling; returns the gradient with respect to the input.
+    pub maxpool2d_backward: fn(&Tensor, &Tensor, usize, usize, usize) -> Tensor,
 }
 
 /// Per-backend registry of op implementations, indexed by [`Device::backend_idx`].
@@ -1589,6 +1593,49 @@ impl Tensor {
             .get()
             .expect("No backend registered for this device. Did you call the backend's init()?");
         (ops.conv2d_backward)(self, weight, grad_out, stride, padding)
+    }
+
+    /// Two-dimensional max pooling over the spatial dimensions of a 4D tensor.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn maxpool2d(&self, kernel_size: usize, stride: usize, padding: usize) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.maxpool2d)(self, kernel_size, stride, padding);
+
+        if is_autograd_enabled() && self.requires_grad() {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record(
+                    &format!("maxpool2d_{kernel_size}_{stride}_{padding}"),
+                    &[self],
+                    &mut out,
+                );
+            }
+        }
+
+        out
+    }
+
+    /// Backward for [`maxpool2d`](Self::maxpool2d): returns the gradient w.r.t. the input.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn maxpool2d_backward(
+        &self,
+        grad_out: &Self,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.maxpool2d_backward)(self, grad_out, kernel_size, stride, padding)
     }
 }
 

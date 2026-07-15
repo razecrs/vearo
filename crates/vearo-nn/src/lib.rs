@@ -228,6 +228,41 @@ impl Module for Conv2d {
     }
 }
 
+/// A 2D max-pooling layer (no learnable parameters).
+pub struct MaxPool2d {
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+}
+
+impl MaxPool2d {
+    /// Creates a new max-pooling layer with the given window, stride, and padding.
+    #[must_use]
+    pub fn new(kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            kernel_size,
+            stride,
+            padding,
+        }
+    }
+
+    /// Device move; a no-op since max pooling holds no parameters.
+    #[must_use]
+    pub fn to(&self, _device: vearo_core::Device) -> Self {
+        Self::new(self.kernel_size, self.stride, self.padding)
+    }
+}
+
+impl Module for MaxPool2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        input.maxpool2d(self.kernel_size, self.stride, self.padding)
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        Vec::new()
+    }
+}
+
 /// An embedding lookup layer.
 pub struct Embedding {
     /// The weight tensor of shape `[vocab_size, embedding_dim]`.

@@ -76,6 +76,15 @@ pub enum OpType {
         /// Zero-padding applied to each spatial side.
         padding: usize,
     },
+    /// Two-dimensional max pooling.
+    MaxPool2d {
+        /// Pooling window size.
+        kernel_size: usize,
+        /// Pooling stride.
+        stride: usize,
+        /// Zero-padding (treated as -inf) applied to each spatial side.
+        padding: usize,
+    },
 }
 
 /// A node in the autograd computation graph.
@@ -210,6 +219,16 @@ fn record_op_callback(op_name: &str, inputs: &[&Tensor], output: &mut Tensor) {
         let stride = parts[0].parse::<usize>().unwrap();
         let padding = parts[1].parse::<usize>().unwrap();
         OpType::Conv2d { stride, padding }
+    } else if let Some(stripped) = op_name.strip_prefix("maxpool2d_") {
+        let parts: Vec<&str> = stripped.split('_').collect();
+        let kernel_size = parts[0].parse::<usize>().unwrap();
+        let stride = parts[1].parse::<usize>().unwrap();
+        let padding = parts[2].parse::<usize>().unwrap();
+        OpType::MaxPool2d {
+            kernel_size,
+            stride,
+            padding,
+        }
     } else {
         match op_name {
             "add" => OpType::Add,
@@ -500,6 +519,15 @@ fn backward_callback(output: &Tensor) {
                 let weight = &node.saved_tensors[1];
                 let (gi, gw, gb) = input.conv2d_backward(weight, &grad_out, *stride, *padding);
                 vec![gi, gw, gb]
+            }
+            OpType::MaxPool2d {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let input = &node.saved_tensors[0];
+                let gi = input.maxpool2d_backward(&grad_out, *kernel_size, *stride, *padding);
+                vec![gi]
             }
             OpType::Sum { dim, keep_dim } => {
                 let x = &node.saved_tensors[0];
@@ -975,6 +1003,43 @@ mod tests {
                 i,
                 grad_x_ana.get_f32(i),
                 grad_x_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_autograd_maxpool2d() {
+        vearo_backend_cpu::init();
+        init();
+
+        // 4x4, distinct values well-separated from each other (no ties), argmax
+        // lands in a different position in each 2x2 window.
+        let vals = [
+            0.3, 0.9, 0.1, 0.7, 0.8, 0.2, 0.6, 0.4, 0.5, 1.1, 0.05, 0.95, 0.15, 0.75, 0.25, 0.65,
+        ];
+        let x = Tensor::from_f32(&vals, [1, 1, 4, 4]);
+        x.set_requires_grad(true);
+
+        let forward = |t_x: &Tensor| {
+            let out = t_x.maxpool2d(2, 2, 0); // [1,1,2,2]
+            out.reshape([4]).sum(0, false)
+        };
+
+        let out = forward(&x);
+        out.backward();
+        let grad_ana = x.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_num = numerical_grad(forward, &x, 1e-4);
+
+        for i in 0..16 {
+            let diff = (grad_ana.get_f32(i) - grad_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on maxpool2d at index {}: ana={}, num={}",
+                i,
+                grad_ana.get_f32(i),
+                grad_num.get_f32(i)
             );
         }
     }

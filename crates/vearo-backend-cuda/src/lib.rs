@@ -143,6 +143,12 @@ pub fn init() {
                 "cross_entropy_forward",
                 "cross_entropy_backward",
                 "matmul_kernel",
+                "conv2d_forward",
+                "conv2d_backward_bias",
+                "conv2d_backward_weight",
+                "conv2d_backward_input",
+                "maxpool2d_forward",
+                "maxpool2d_backward",
             ],
         )
         .expect("Failed to load Vearo CUDA kernels");
@@ -169,32 +175,321 @@ pub fn init() {
             cross_entropy_backward,
             conv2d,
             conv2d_backward,
+            maxpool2d,
+            maxpool2d_backward,
         },
     );
 }
 
-/// Convolution is not yet implemented on the CUDA backend (run conv on CPU).
+/// 2D convolution (NCHW input, OIHW weight) on CUDA. Bit-matches the CPU backend.
 pub fn conv2d(
-    _input: &Tensor,
-    _weight: &Tensor,
-    _bias: &Tensor,
-    _stride: usize,
-    _padding: usize,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    stride: usize,
+    padding: usize,
 ) -> Tensor {
-    unimplemented!("conv2d is not yet implemented on the CUDA backend; use the CPU backend")
+    let dev = get_cuda_device();
+    let input = input.contiguous();
+    let weight = weight.contiguous();
+    let bias = bias.contiguous();
+    let id = input.shape().dims();
+    let wd = weight.shape().dims();
+    let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
+    let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
+
+    let oh = (h + 2 * padding - kh) / stride + 1;
+    let ow = (w + 2 * padding - kw) / stride + 1;
+    let out_shape = Shape::new([n, cout, oh, ow]);
+    let out_storage = cuda_alloc(out_shape.numel());
+    let out = Tensor::from_components(
+        out_storage,
+        out_shape,
+        out_shape.contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let p = conv_params(n, cin, h, w, cout, kh, kw, oh, ow, stride, padding);
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[input.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let w_slice = &slots[weight.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let b_slice = &slots[bias.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let out_slice = &slots[out_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "conv2d_forward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(out_shape.numel() as u32);
+    unsafe {
+        func.launch(cfg, (x_slice, w_slice, b_slice, out_slice, &p_dev))
+            .unwrap();
+    }
+    out
 }
 
-/// Convolution backward is not yet implemented on the CUDA backend.
+/// Pack conv shape parameters into the layout the kernels expect.
+fn conv_params(
+    n: usize,
+    cin: usize,
+    h: usize,
+    w: usize,
+    cout: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    stride: usize,
+    padding: usize,
+) -> Vec<i32> {
+    vec![
+        n as i32,
+        cin as i32,
+        h as i32,
+        w as i32,
+        cout as i32,
+        kh as i32,
+        kw as i32,
+        oh as i32,
+        ow as i32,
+        stride as i32,
+        padding as i32,
+    ]
+}
+
+/// Backward for [`conv2d`] on CUDA: returns `(grad_input, grad_weight, grad_bias)`.
+/// Bit-matches the CPU backend (gather kernels, no atomics -> deterministic order).
 pub fn conv2d_backward(
-    _input: &Tensor,
-    _weight: &Tensor,
-    _grad_out: &Tensor,
-    _stride: usize,
-    _padding: usize,
+    input: &Tensor,
+    weight: &Tensor,
+    grad_out: &Tensor,
+    stride: usize,
+    padding: usize,
 ) -> (Tensor, Tensor, Tensor) {
-    unimplemented!(
-        "conv2d_backward is not yet implemented on the CUDA backend; use the CPU backend"
-    )
+    let dev = get_cuda_device();
+    let input = input.contiguous();
+    let weight = weight.contiguous();
+    let grad_out = grad_out.contiguous();
+    let id = input.shape().dims();
+    let wd = weight.shape().dims();
+    let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
+    let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
+    let gd = grad_out.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let gi_storage = cuda_alloc(input.shape().numel());
+    let gw_storage = cuda_alloc(weight.shape().numel());
+    let gb_storage = cuda_alloc(cout);
+    let grad_in = Tensor::from_components(
+        gi_storage,
+        *input.shape(),
+        input.shape().contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    let grad_w = Tensor::from_components(
+        gw_storage,
+        *weight.shape(),
+        weight.shape().contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    let grad_b = Tensor::from_components(
+        gb_storage,
+        Shape::new([cout]),
+        Shape::new([cout]).contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+
+    if input.shape().numel() == 0 {
+        return (grad_in, grad_w, grad_b);
+    }
+
+    let p = conv_params(n, cin, h, w, cout, kh, kw, oh, ow, stride, padding);
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[input.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let w_slice = &slots[weight.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let go_slice = &slots[grad_out.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let gi_slice = &slots[gi_storage.slot_idx as usize].as_ref().unwrap().slice;
+    let gw_slice = &slots[gw_storage.slot_idx as usize].as_ref().unwrap().slice;
+    let gb_slice = &slots[gb_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let f_bias = dev
+        .get_func("vearo_kernels", "conv2d_backward_bias")
+        .unwrap();
+    unsafe {
+        f_bias
+            .launch(
+                LaunchConfig::for_num_elems(cout as u32),
+                (go_slice, gb_slice, &p_dev),
+            )
+            .unwrap();
+    }
+
+    let f_weight = dev
+        .get_func("vearo_kernels", "conv2d_backward_weight")
+        .unwrap();
+    unsafe {
+        f_weight
+            .launch(
+                LaunchConfig::for_num_elems(weight.shape().numel() as u32),
+                (x_slice, go_slice, gw_slice, &p_dev),
+            )
+            .unwrap();
+    }
+
+    let f_input = dev
+        .get_func("vearo_kernels", "conv2d_backward_input")
+        .unwrap();
+    unsafe {
+        f_input
+            .launch(
+                LaunchConfig::for_num_elems(input.shape().numel() as u32),
+                (w_slice, go_slice, gi_slice, &p_dev),
+            )
+            .unwrap();
+    }
+
+    (grad_in, grad_w, grad_b)
+}
+
+/// Pack max-pool shape parameters into the layout the kernels expect.
+fn maxpool_params(
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    oh: usize,
+    ow: usize,
+    stride: usize,
+    padding: usize,
+) -> Vec<i32> {
+    vec![
+        n as i32,
+        c as i32,
+        h as i32,
+        w as i32,
+        k as i32,
+        oh as i32,
+        ow as i32,
+        stride as i32,
+        padding as i32,
+    ]
+}
+
+/// 2D max pooling (NCHW) on CUDA. Bit-matches the CPU backend.
+pub fn maxpool2d(input: &Tensor, kernel_size: usize, stride: usize, padding: usize) -> Tensor {
+    let dev = get_cuda_device();
+    let input = input.contiguous();
+    let id = input.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let oh = (h + 2 * padding - kernel_size) / stride + 1;
+    let ow = (w + 2 * padding - kernel_size) / stride + 1;
+    let out_shape = Shape::new([n, c, oh, ow]);
+    let out_storage = cuda_alloc(out_shape.numel());
+    let out = Tensor::from_components(
+        out_storage,
+        out_shape,
+        out_shape.contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let p = maxpool_params(n, c, h, w, kernel_size, oh, ow, stride, padding);
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[input.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let out_slice = &slots[out_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "maxpool2d_forward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(out_shape.numel() as u32);
+    unsafe {
+        func.launch(cfg, (x_slice, out_slice, &p_dev)).unwrap();
+    }
+    out
+}
+
+/// Backward for [`maxpool2d`] on CUDA: returns grad input. Bit-matches the CPU backend.
+pub fn maxpool2d_backward(
+    input: &Tensor,
+    grad_out: &Tensor,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    let dev = get_cuda_device();
+    let input = input.contiguous();
+    let grad_out = grad_out.contiguous();
+    let id = input.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let gd = grad_out.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let gi_storage = cuda_alloc(input.shape().numel());
+    let grad_in = Tensor::from_components(
+        gi_storage,
+        *input.shape(),
+        input.shape().contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    if input.shape().numel() == 0 {
+        return grad_in;
+    }
+
+    let p = maxpool_params(n, c, h, w, kernel_size, oh, ow, stride, padding);
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[input.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let go_slice = &slots[grad_out.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let gi_slice = &slots[gi_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "maxpool2d_backward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(input.shape().numel() as u32);
+    unsafe {
+        func.launch(cfg, (x_slice, go_slice, gi_slice, &p_dev))
+            .unwrap();
+    }
+    grad_in
 }
 
 fn binary_op(lhs: &Tensor, rhs: &Tensor, kernel_name: &str) -> Tensor {
@@ -345,8 +640,8 @@ pub fn matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
 
     let block_dim = (16, 16, 1);
     let grid_dim = (
-        ((n + 15) / 16) as u32,
-        ((m + 15) / 16) as u32,
+        n.div_ceil(16) as u32,
+        m.div_ceil(16) as u32,
         batch_size as u32,
     );
     let cfg = LaunchConfig {
@@ -475,6 +770,8 @@ pub fn gelu(x: &Tensor) -> Tensor {
 
 fn unary_op(x: &Tensor, kernel_name: &str) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel reads memory in storage order; materialize non-contiguous inputs first.
+    let x = x.contiguous();
     let numel = x.shape().numel();
     let out_storage = cuda_alloc(numel);
     let out_tensor = Tensor::from_components(
@@ -507,6 +804,9 @@ fn unary_op(x: &Tensor, kernel_name: &str) -> Tensor {
 
 pub fn softmax(x: &Tensor, dim: usize) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel writes out[x_off] using the input's strides; a non-contiguous input
+    // would scatter the result into the contiguous output buffer.
+    let x = x.contiguous();
     let x_shape = x.shape();
     let rank = x_shape.rank();
     assert!(dim < rank, "Softmax dim out of bounds");
@@ -567,6 +867,8 @@ pub fn softmax(x: &Tensor, dim: usize) -> Tensor {
 
 pub fn layernorm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel indexes rows as idx*norm_dim, assuming contiguous storage.
+    let x = x.contiguous();
     let x_shape = x.shape();
     let out_storage = cuda_alloc(x_shape.numel());
     let out_tensor = Tensor::from_components(
@@ -629,6 +931,9 @@ pub fn layernorm_backward(
     eps: f32,
 ) -> (Tensor, Tensor, Tensor) {
     let dev = get_cuda_device();
+    // Kernel assumes contiguous storage for both x and grad_out.
+    let x = x.contiguous();
+    let grad_out = grad_out.contiguous();
     let x_shape = x.shape();
 
     let gx_storage = cuda_alloc(x_shape.numel());
@@ -712,6 +1017,8 @@ pub fn layernorm_backward(
 
 pub fn embedding(x: &Tensor, weight: &Tensor) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel reads index x[idx] in storage order.
+    let x = x.contiguous();
     let x_shape = x.shape();
 
     let vocab_size = weight.shape()[0];
@@ -767,6 +1074,9 @@ pub fn embedding(x: &Tensor, weight: &Tensor) -> Tensor {
 
 pub fn embedding_backward(x: &Tensor, weight: &Tensor, grad_out: &Tensor) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel assumes contiguous storage for the index tensor and grad_out.
+    let x = x.contiguous();
+    let grad_out = grad_out.contiguous();
     let x_shape = x.shape();
 
     let vocab_size = weight.shape()[0];
@@ -818,6 +1128,8 @@ pub fn embedding_backward(x: &Tensor, weight: &Tensor, grad_out: &Tensor) -> Ten
 
 pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel indexes logits as idx*vocab_size, assuming contiguous storage.
+    let logits = logits.contiguous();
     let batch_size = logits.shape()[0];
     let vocab_size = logits.shape()[1];
 
@@ -873,6 +1185,9 @@ pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
         )
         .unwrap();
     }
+    // Release the CUDA_SLOTS lock BEFORE mean(), which re-locks it. Holding it across
+    // the mean() call self-deadlocks (std Mutex is not reentrant).
+    drop(slots);
 
     let was_enabled = vearo_core::is_autograd_enabled();
     vearo_core::set_autograd_enabled(false);
@@ -883,6 +1198,9 @@ pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
 
 pub fn cross_entropy_backward(logits: &Tensor, targets: &Tensor, grad_out: &Tensor) -> Tensor {
     let dev = get_cuda_device();
+    // Kernel assumes contiguous storage for logits and grad_out.
+    let logits = logits.contiguous();
+    let grad_out = grad_out.contiguous();
     let batch_size = logits.shape()[0];
     let vocab_size = logits.shape()[1];
 
@@ -997,5 +1315,198 @@ mod tests {
             c_g.to_vec_f32(),
             "CUDA matmul must handle transposed inputs"
         );
+    }
+
+    fn setup() {
+        vearo_backend_cpu::init();
+        vearo_core::register_refcount_inc(cuda_refcount_inc);
+        vearo_core::register_refcount_dec(cuda_refcount_dec);
+        vearo_core::register_cuda_hooks(cuda_read, cuda_write, cuda_alloc);
+        init();
+    }
+
+    /// Audit every CUDA op for the "assumes contiguous" bug that once broke matmul.
+    /// For each op we run it on a non-contiguous input AND on `input.contiguous()`,
+    /// both on the GPU. A stride-correct kernel yields the same output; a kernel that
+    /// reads raw device memory in storage order diverges (wrong elements -> huge diff).
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::float_cmp)]
+    fn test_cuda_noncontiguous_parity() {
+        setup();
+        vearo_core::set_autograd_enabled(false);
+
+        let cuda = Device::Cuda(0);
+        let mut fails: Vec<String> = Vec::new();
+        let mut check = |name: &str, nc: &Tensor, c: &Tensor| {
+            let a = nc.to(Device::Cpu).to_vec_f32();
+            let b = c.to(Device::Cpu).to_vec_f32();
+            let bad = a.iter().any(|v| !v.is_finite());
+            let maxdiff = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            if a.len() != b.len() || bad || maxdiff > 1e-3 {
+                fails.push(format!("{name} (maxdiff={maxdiff}, nonfinite={bad})"));
+            }
+        };
+
+        // binary elementwise: transposed rhs (the backward case), and transposed lhs
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], [3, 3]).to(cuda);
+        let b = Tensor::from_f32(&[9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], [3, 3]).to(cuda);
+        let bt = b.transpose(0, 1);
+        check("add(rhs_nc)", &a.add(&bt), &a.add(&bt.contiguous()));
+        check("sub(rhs_nc)", &a.sub(&bt), &a.sub(&bt.contiguous()));
+        check("mul(rhs_nc)", &a.mul(&bt), &a.mul(&bt.contiguous()));
+        check("div(rhs_nc)", &a.div(&bt), &a.div(&bt.contiguous()));
+        let at = a.transpose(0, 1);
+        check("add(lhs_nc)", &at.add(&b), &at.contiguous().add(&b));
+
+        // unary: transposed input
+        let x = Tensor::from_f32(
+            &[-2.0, -1.0, 0.5, 1.0, 2.0, 3.0, -0.5, 4.0, -3.0, 0.0, 1.5, -1.5],
+            [3, 4],
+        )
+        .to(cuda);
+        let xt = x.transpose(0, 1); // [4,3] non-contiguous
+        check("relu(nc)", &xt.relu(), &xt.contiguous().relu());
+        check("gelu(nc)", &xt.gelu(), &xt.contiguous().gelu());
+
+        // reductions over each axis
+        check("sum(nc,d0)", &xt.sum(0, false), &xt.contiguous().sum(0, false));
+        check("sum(nc,d1)", &xt.sum(1, true), &xt.contiguous().sum(1, true));
+        check("mean(nc,d0)", &xt.mean(0, false), &xt.contiguous().mean(0, false));
+
+        // softmax over each axis
+        check("softmax(nc,d0)", &xt.softmax(0), &xt.contiguous().softmax(0));
+        check("softmax(nc,d1)", &xt.softmax(1), &xt.contiguous().softmax(1));
+
+        // layernorm: permuted so it stays non-contiguous but the normalized last dim is intact
+        let ln =
+            Tensor::from_f32(&(0..24).map(|i| i as f32 * 0.1).collect::<Vec<_>>(), [2, 3, 4]).to(cuda);
+        let lnp = ln.permute([1, 0, 2]); // [3,2,4] non-contiguous, last dim = 4
+        let w = Tensor::from_f32(&[1.0, 0.5, 2.0, 1.5], [4]).to(cuda);
+        let bb = Tensor::from_f32(&[0.1, -0.1, 0.2, 0.0], [4]).to(cuda);
+        check(
+            "layernorm(nc)",
+            &lnp.layernorm(&w, &bb, 1e-5),
+            &lnp.contiguous().layernorm(&w, &bb, 1e-5),
+        );
+
+        // embedding: non-contiguous index tensor
+        let idx = Tensor::from_f32(&[0.0, 2.0, 1.0, 1.0, 0.0, 2.0], [2, 3]).to(cuda);
+        let idxt = idx.transpose(0, 1); // [3,2] non-contiguous
+        let emb_w = Tensor::from_f32(&[10.0, 11.0, 20.0, 21.0, 30.0, 31.0], [3, 2]).to(cuda);
+        check(
+            "embedding(nc)",
+            &idxt.embedding(&emb_w),
+            &idxt.contiguous().embedding(&emb_w),
+        );
+
+        // cross_entropy: non-contiguous logits [batch, vocab]
+        let logits_base = Tensor::from_f32(&[1.0, 4.0, 2.0, 5.0, 3.0, 6.0], [3, 2]).to(cuda);
+        let logits_nc = logits_base.transpose(0, 1); // [2,3] non-contiguous
+        let tgt = Tensor::from_f32(&[0.0, 2.0], [2]).to(cuda);
+        check(
+            "cross_entropy(nc)",
+            &logits_nc.cross_entropy(&tgt),
+            &logits_nc.contiguous().cross_entropy(&tgt),
+        );
+
+        assert!(
+            fails.is_empty(),
+            "CUDA ops that mishandle non-contiguous inputs: {fails:?}"
+        );
+    }
+
+    /// conv2d forward + all three gradients must match the CPU backend.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_cuda_conv2d_parity() {
+        setup();
+        vearo_core::set_autograd_enabled(false);
+        let cuda = Device::Cuda(0);
+
+        fn assert_close(name: &str, cpu: &Tensor, gpu: &Tensor) {
+            let a = cpu.to_vec_f32();
+            let b = gpu.to(Device::Cpu).to_vec_f32();
+            assert_eq!(a.len(), b.len(), "{name}: length mismatch");
+            let maxdiff = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(maxdiff < 1e-4, "{name}: max abs diff {maxdiff}");
+        }
+
+        let mk = |numel: usize, seed: f32| -> Vec<f32> {
+            (0..numel).map(|i| (i as f32 * seed + seed).sin()).collect()
+        };
+
+        for &(stride, padding) in &[(1usize, 1usize), (2usize, 1usize)] {
+            let (n, cin, h, w) = (2usize, 3usize, 5usize, 5usize);
+            let (cout, kh, kw) = (4usize, 3usize, 3usize);
+            let oh = (h + 2 * padding - kh) / stride + 1;
+            let ow = (w + 2 * padding - kw) / stride + 1;
+
+            let x = Tensor::from_f32(&mk(n * cin * h * w, 0.3), [n, cin, h, w]);
+            let wt = Tensor::from_f32(&mk(cout * cin * kh * kw, 0.7), [cout, cin, kh, kw]);
+            let b = Tensor::from_f32(&mk(cout, 1.1), [cout]);
+            let go = Tensor::from_f32(&mk(n * cout * oh * ow, 0.5), [n, cout, oh, ow]);
+
+            let (xg, wg, bg, gog) = (x.to(cuda), wt.to(cuda), b.to(cuda), go.to(cuda));
+
+            // forward
+            assert_close(
+                &format!("fwd s{stride}p{padding}"),
+                &x.conv2d(&wt, &b, stride, padding),
+                &xg.conv2d(&wg, &bg, stride, padding),
+            );
+
+            // backward: grad_input, grad_weight, grad_bias
+            let (gi_c, gw_c, gb_c) = x.conv2d_backward(&wt, &go, stride, padding);
+            let (gi_g, gw_g, gb_g) = xg.conv2d_backward(&wg, &gog, stride, padding);
+            assert_close(&format!("grad_input s{stride}p{padding}"), &gi_c, &gi_g);
+            assert_close(&format!("grad_weight s{stride}p{padding}"), &gw_c, &gw_g);
+            assert_close(&format!("grad_bias s{stride}p{padding}"), &gb_c, &gb_g);
+        }
+    }
+
+    /// maxpool2d forward + backward must match the CPU backend.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_cuda_maxpool2d_parity() {
+        setup();
+        vearo_core::set_autograd_enabled(false);
+        let cuda = Device::Cuda(0);
+
+        let mk = |numel: usize, seed: f32| -> Vec<f32> {
+            (0..numel).map(|i| (i as f32 * seed + seed).sin()).collect()
+        };
+        let maxdiff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+
+        for &(k, stride, padding) in &[(2usize, 2usize, 0usize), (3usize, 2usize, 1usize)] {
+            let (n, c, h, w) = (2usize, 3usize, 6usize, 6usize);
+            let oh = (h + 2 * padding - k) / stride + 1;
+            let ow = (w + 2 * padding - k) / stride + 1;
+
+            let x = Tensor::from_f32(&mk(n * c * h * w, 0.3), [n, c, h, w]);
+            let go = Tensor::from_f32(&mk(n * c * oh * ow, 0.5), [n, c, oh, ow]);
+            let xg = x.to(cuda);
+            let gog = go.to(cuda);
+
+            let fwd_c = x.maxpool2d(k, stride, padding).to_vec_f32();
+            let fwd_g = xg.maxpool2d(k, stride, padding).to(Device::Cpu).to_vec_f32();
+            assert!(maxdiff(&fwd_c, &fwd_g) < 1e-4, "maxpool fwd k{k}s{stride}p{padding}");
+
+            let gi_c = x.maxpool2d_backward(&go, k, stride, padding).to_vec_f32();
+            let gi_g = xg
+                .maxpool2d_backward(&gog, k, stride, padding)
+                .to(Device::Cpu)
+                .to_vec_f32();
+            assert!(maxdiff(&gi_c, &gi_g) < 1e-4, "maxpool bwd k{k}s{stride}p{padding}");
+        }
     }
 }

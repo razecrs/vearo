@@ -39,6 +39,8 @@ pub fn init() {
             cross_entropy_backward,
             conv2d,
             conv2d_backward,
+            maxpool2d,
+            maxpool2d_backward,
         },
     );
 }
@@ -1169,6 +1171,113 @@ pub fn conv2d_backward(
         Tensor::from_f32(&gw, *wc.shape()),
         Tensor::from_f32(&gb, [cout]),
     )
+}
+
+/// 2D max pooling (NCHW). Padded positions are treated as -inf (never selected).
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+pub fn maxpool2d(input: &Tensor, kernel_size: usize, stride: usize, padding: usize) -> Tensor {
+    let ic = input.contiguous();
+    let id = ic.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let oh = (h + 2 * padding - kernel_size) / stride + 1;
+    let ow = (w + 2 * padding - kernel_size) / stride + 1;
+    let out_shape = Shape::new([n, c, oh, ow]);
+    let out = Tensor::zeros(out_shape, vearo_core::DType::F32);
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let x = read_f32(&ic);
+    let mut out_data = vec![0.0f32; out_shape.numel()];
+
+    for nn in 0..n {
+        for cc in 0..c {
+            for y in 0..oh {
+                for x_out in 0..ow {
+                    let mut best = f32::NEG_INFINITY;
+                    for i in 0..kernel_size {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let ih = ih - padding;
+                        for j in 0..kernel_size {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            let iw = iw - padding;
+                            let v = x[((nn * c + cc) * h + ih) * w + iw];
+                            if v > best {
+                                best = v;
+                            }
+                        }
+                    }
+                    out_data[((nn * c + cc) * oh + y) * ow + x_out] = best;
+                }
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Backward for [`maxpool2d`]: routes each output gradient to the argmax input
+/// (first occurrence on ties, matching the forward pass). Returns grad input.
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+pub fn maxpool2d_backward(
+    input: &Tensor,
+    grad_out: &Tensor,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    let ic = input.contiguous();
+    let gc = grad_out.contiguous();
+    let id = ic.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let gd = gc.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let x = read_f32(&ic);
+    let go = read_f32(&gc);
+    let mut gi = vec![0.0f32; ic.shape().numel()];
+
+    for nn in 0..n {
+        for cc in 0..c {
+            for y in 0..oh {
+                for x_out in 0..ow {
+                    let mut best = f32::NEG_INFINITY;
+                    let mut best_idx = usize::MAX;
+                    for i in 0..kernel_size {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let ih = ih - padding;
+                        for j in 0..kernel_size {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            let iw = iw - padding;
+                            let idx = ((nn * c + cc) * h + ih) * w + iw;
+                            if x[idx] > best {
+                                best = x[idx];
+                                best_idx = idx;
+                            }
+                        }
+                    }
+                    if best_idx != usize::MAX {
+                        gi[best_idx] += go[((nn * c + cc) * oh + y) * ow + x_out];
+                    }
+                }
+            }
+        }
+    }
+
+    Tensor::from_f32(&gi, *ic.shape())
 }
 
 #[cfg(test)]

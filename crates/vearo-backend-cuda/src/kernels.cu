@@ -465,3 +465,211 @@ extern "C" __global__ void matmul_kernel(
         out[b * out_batch_stride + row * N + col] = val;
     }
 }
+
+// Conv2D (NCHW input, OIHW weight), direct convolution. Params packed in p:
+// [n, cin, h, w, cout, kh, kw, oh, ow, stride, padding].
+// Backward uses gather kernels (one thread per output element, no atomics) so the
+// accumulation order matches the CPU backend bit-for-bit.
+
+extern "C" __global__ void conv2d_forward(
+    const float* x, const float* weight, const float* bias, float* out,
+    const int* p
+) {
+    int n = p[0], cin = p[1], h = p[2], w = p[3];
+    int cout = p[4], kh = p[5], kw = p[6];
+    int oh = p[7], ow = p[8], stride = p[9], padding = p[10];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * cout * oh * ow) return;
+
+    int x_out = idx % ow;
+    int y = (idx / ow) % oh;
+    int co = (idx / (ow * oh)) % cout;
+    int nn = idx / (ow * oh * cout);
+
+    float acc = bias[co];
+    for (int c = 0; c < cin; ++c) {
+        for (int i = 0; i < kh; ++i) {
+            int ih = y * stride + i;
+            if (ih < padding || ih >= h + padding) continue;
+            int iha = ih - padding;
+            for (int j = 0; j < kw; ++j) {
+                int iw = x_out * stride + j;
+                if (iw < padding || iw >= w + padding) continue;
+                int iwa = iw - padding;
+                int x_idx = ((nn * cin + c) * h + iha) * w + iwa;
+                int w_idx = ((co * cin + c) * kh + i) * kw + j;
+                acc = fmaf(x[x_idx], weight[w_idx], acc);
+            }
+        }
+    }
+    out[((nn * cout + co) * oh + y) * ow + x_out] = acc;
+}
+
+// grad_bias[co] = sum over (nn, y, x_out) of grad_out  (plain add, CPU order)
+extern "C" __global__ void conv2d_backward_bias(
+    const float* grad_out, float* grad_bias, const int* p
+) {
+    int n = p[0], cout = p[4], oh = p[7], ow = p[8];
+    int co = blockIdx.x * blockDim.x + threadIdx.x;
+    if (co >= cout) return;
+    float acc = 0.0f;
+    for (int nn = 0; nn < n; ++nn)
+        for (int y = 0; y < oh; ++y)
+            for (int x_out = 0; x_out < ow; ++x_out)
+                acc += grad_out[((nn * cout + co) * oh + y) * ow + x_out];
+    grad_bias[co] = acc;
+}
+
+// grad_weight[co,c,i,j] = sum over (nn, y, x_out) of grad_out * x  (fmaf, CPU order)
+extern "C" __global__ void conv2d_backward_weight(
+    const float* x, const float* grad_out, float* grad_w, const int* p
+) {
+    int n = p[0], cin = p[1], h = p[2], w = p[3];
+    int cout = p[4], kh = p[5], kw = p[6];
+    int oh = p[7], ow = p[8], stride = p[9], padding = p[10];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= cout * cin * kh * kw) return;
+
+    int j = idx % kw;
+    int i = (idx / kw) % kh;
+    int c = (idx / (kw * kh)) % cin;
+    int co = idx / (kw * kh * cin);
+
+    float acc = 0.0f;
+    for (int nn = 0; nn < n; ++nn) {
+        for (int y = 0; y < oh; ++y) {
+            int ih = y * stride + i;
+            if (ih < padding || ih >= h + padding) continue;
+            int iha = ih - padding;
+            for (int x_out = 0; x_out < ow; ++x_out) {
+                int iw = x_out * stride + j;
+                if (iw < padding || iw >= w + padding) continue;
+                int iwa = iw - padding;
+                int x_idx = ((nn * cin + c) * h + iha) * w + iwa;
+                float g = grad_out[((nn * cout + co) * oh + y) * ow + x_out];
+                acc = fmaf(g, x[x_idx], acc);
+            }
+        }
+    }
+    grad_w[((co * cin + c) * kh + i) * kw + j] = acc;
+}
+
+// grad_input[nn,c,p,q] = sum of grad_out * weight over the (co, y, x_out, i, j)
+// whose receptive field lands on (p,q). Loop order co,y,x_out,i,j matches CPU.
+extern "C" __global__ void conv2d_backward_input(
+    const float* weight, const float* grad_out, float* grad_in, const int* p
+) {
+    int n = p[0], cin = p[1], h = p[2], w = p[3];
+    int cout = p[4], kh = p[5], kw = p[6];
+    int oh = p[7], ow = p[8], stride = p[9], padding = p[10];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * cin * h * w) return;
+
+    int q = idx % w;
+    int pp = (idx / w) % h;
+    int c = (idx / (w * h)) % cin;
+    int nn = idx / (w * h * cin);
+
+    float acc = 0.0f;
+    for (int co = 0; co < cout; ++co) {
+        for (int y = 0; y < oh; ++y) {
+            for (int x_out = 0; x_out < ow; ++x_out) {
+                for (int i = 0; i < kh; ++i) {
+                    int ih = y * stride + i;
+                    if (ih < padding || ih >= h + padding) continue;
+                    if (ih - padding != pp) continue;
+                    for (int j = 0; j < kw; ++j) {
+                        int iw = x_out * stride + j;
+                        if (iw < padding || iw >= w + padding) continue;
+                        if (iw - padding != q) continue;
+                        int w_idx = ((co * cin + c) * kh + i) * kw + j;
+                        float g = grad_out[((nn * cout + co) * oh + y) * ow + x_out];
+                        acc = fmaf(g, weight[w_idx], acc);
+                    }
+                }
+            }
+        }
+    }
+    grad_in[idx] = acc;
+}
+
+// Max pooling (NCHW). p: [n, c, h, w, k, oh, ow, stride, padding].
+// Padded positions treated as -inf (never selected).
+extern "C" __global__ void maxpool2d_forward(
+    const float* x, float* out, const int* p
+) {
+    int n = p[0], c = p[1], h = p[2], w = p[3], k = p[4];
+    int oh = p[5], ow = p[6], stride = p[7], padding = p[8];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * c * oh * ow) return;
+
+    int x_out = idx % ow;
+    int y = (idx / ow) % oh;
+    int cc = (idx / (ow * oh)) % c;
+    int nn = idx / (ow * oh * c);
+
+    float best = -INFINITY;
+    for (int i = 0; i < k; ++i) {
+        int ih = y * stride + i;
+        if (ih < padding || ih >= h + padding) continue;
+        int iha = ih - padding;
+        for (int j = 0; j < k; ++j) {
+            int iw = x_out * stride + j;
+            if (iw < padding || iw >= w + padding) continue;
+            int iwa = iw - padding;
+            float v = x[((nn * c + cc) * h + iha) * w + iwa];
+            if (v > best) best = v;
+        }
+    }
+    out[((nn * c + cc) * oh + y) * ow + x_out] = best;
+}
+
+// Backward: grad_in[nn,cc,pp,qq] = sum of grad_out over windows whose argmax is
+// (pp,qq). Recomputes each covering window's argmax (first-max, matching forward)
+// and iterates windows in (y, x_out) order with plain += to match the CPU order.
+extern "C" __global__ void maxpool2d_backward(
+    const float* x, const float* grad_out, float* grad_in, const int* p
+) {
+    int n = p[0], c = p[1], h = p[2], w = p[3], k = p[4];
+    int oh = p[5], ow = p[6], stride = p[7], padding = p[8];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * c * h * w) return;
+
+    int qq = idx % w;
+    int pp = (idx / w) % h;
+    int cc = (idx / (w * h)) % c;
+    int nn = idx / (w * h * c);
+
+    float acc = 0.0f;
+    for (int y = 0; y < oh; ++y) {
+        int i = pp + padding - y * stride;
+        if (i < 0 || i >= k) continue;
+        for (int x_out = 0; x_out < ow; ++x_out) {
+            int j = qq + padding - x_out * stride;
+            if (j < 0 || j >= k) continue;
+            float best = -INFINITY;
+            int bih = -1, biw = -1;
+            for (int a = 0; a < k; ++a) {
+                int ih = y * stride + a;
+                if (ih < padding || ih >= h + padding) continue;
+                int iha = ih - padding;
+                for (int b = 0; b < k; ++b) {
+                    int iw = x_out * stride + b;
+                    if (iw < padding || iw >= w + padding) continue;
+                    int iwa = iw - padding;
+                    float v = x[((nn * c + cc) * h + iha) * w + iwa];
+                    if (v > best) { best = v; bih = iha; biw = iwa; }
+                }
+            }
+            if (bih == pp && biw == qq) {
+                acc += grad_out[((nn * c + cc) * oh + y) * ow + x_out];
+            }
+        }
+    }
+    grad_in[idx] = acc;
+}

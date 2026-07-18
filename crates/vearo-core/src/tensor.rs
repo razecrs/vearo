@@ -19,13 +19,16 @@ pub struct Tensor {
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
-        if let Some(inc) = REFCOUNT_INC.get() {
-            inc(self.storage_id, self.device);
-        } else if self.device.is_cpu() {
+        // Device checked first: the CPU arena is owned by core, REFCOUNT_INC is for
+        // device backends only. Hook-first stranded every CPU refcount once a device
+        // backend registered (see the matching note in Drop).
+        if self.device.is_cpu() {
             get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .increment(self.storage_id.slot_idx);
+        } else if let Some(inc) = REFCOUNT_INC.get() {
+            inc(self.storage_id, self.device);
         }
         Self {
             storage_id: self.storage_id,
@@ -41,9 +44,12 @@ impl Clone for Tensor {
 
 impl Drop for Tensor {
     fn drop(&mut self) {
-        let is_last = if let Some(dec) = REFCOUNT_DEC.get() {
-            dec(self.storage_id, self.device)
-        } else if self.device.is_cpu() {
+        // NOTE: device is checked FIRST, before the hook. CPU storage lives in this
+        // crate's arena, so core always owns that path; REFCOUNT_DEC exists only for
+        // device backends. Testing the hook first meant that once a device backend
+        // registered it, every CPU tensor took that branch, the hook ignored non-CUDA
+        // devices, and the arena slot was never reclaimed (unbounded host-memory leak).
+        let is_last = if self.device.is_cpu() {
             let mut shard = get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -57,12 +63,18 @@ impl Drop for Tensor {
 
             shard.decrement(self.storage_id.slot_idx);
             last
+        } else if let Some(dec) = REFCOUNT_DEC.get() {
+            dec(self.storage_id, self.device)
         } else {
             false
         };
 
+        // Device is passed too: CPU and CUDA maintain independent StorageId spaces
+        // (CUDA allocates at shard_idx 0, which CPU shard 0 also uses), so a bare
+        // StorageId is NOT a unique key. Without the device, dropping a CPU tensor
+        // could evict a CUDA tensor's gradient that happened to share slot numbers.
         if is_last && let Some(drop_hook) = DROP_HOOK.get() {
-            drop_hook(self.storage_id);
+            drop_hook(self.storage_id, self.device);
         }
     }
 }
@@ -487,13 +499,16 @@ impl Tensor {
         );
         let contiguous_self = self.contiguous();
         let new_strides = new_shape.contiguous_strides();
-        if let Some(inc) = REFCOUNT_INC.get() {
-            inc(contiguous_self.storage_id, contiguous_self.device);
-        } else if contiguous_self.device.is_cpu() {
+        // Device checked first (see the note in Drop): the returned tensor shares
+        // contiguous_self's storage, so that refcount MUST be incremented here or the
+        // slot is freed when contiguous_self drops at end of scope.
+        if contiguous_self.device.is_cpu() {
             get_cpu_shard(contiguous_self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .increment(contiguous_self.storage_id.slot_idx);
+        } else if let Some(inc) = REFCOUNT_INC.get() {
+            inc(contiguous_self.storage_id, contiguous_self.device);
         }
         let mut out = Self {
             storage_id: contiguous_self.storage_id,
@@ -522,13 +537,16 @@ impl Tensor {
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Self {
         let shape = self.shape.swapped(dim0, dim1);
         let strides = self.strides.swapped(dim0, dim1);
-        if let Some(inc) = REFCOUNT_INC.get() {
-            inc(self.storage_id, self.device);
-        } else if self.device.is_cpu() {
+        // Device checked first: the CPU arena is owned by core, REFCOUNT_INC is for
+        // device backends only. Hook-first stranded every CPU refcount once a device
+        // backend registered (see the matching note in Drop).
+        if self.device.is_cpu() {
             get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .increment(self.storage_id.slot_idx);
+        } else if let Some(inc) = REFCOUNT_INC.get() {
+            inc(self.storage_id, self.device);
         }
         let mut out = Self {
             storage_id: self.storage_id,
@@ -583,13 +601,16 @@ impl Tensor {
         let new_shape = Shape::new(&new_dims[..rank]);
         let new_strides_shape = Shape::new(&new_strides[..rank]);
 
-        if let Some(inc) = REFCOUNT_INC.get() {
-            inc(self.storage_id, self.device);
-        } else if self.device.is_cpu() {
+        // Device checked first: the CPU arena is owned by core, REFCOUNT_INC is for
+        // device backends only. Hook-first stranded every CPU refcount once a device
+        // backend registered (see the matching note in Drop).
+        if self.device.is_cpu() {
             get_cpu_shard(self.storage_id.shard_idx as usize)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .increment(self.storage_id.slot_idx);
+        } else if let Some(inc) = REFCOUNT_INC.get() {
+            inc(self.storage_id, self.device);
         }
 
         let mut out = Self {
@@ -1088,6 +1109,16 @@ pub struct BackendOps {
     pub maxpool2d: fn(&Tensor, usize, usize, usize) -> Tensor,
     /// Backward for max pooling; returns the gradient with respect to the input.
     pub maxpool2d_backward: fn(&Tensor, &Tensor, usize, usize, usize) -> Tensor,
+    /// Two-dimensional average pooling (input, window, stride, padding).
+    pub avgpool2d: fn(&Tensor, usize, usize, usize) -> Tensor,
+    /// Backward for average pooling; returns the gradient with respect to the input.
+    pub avgpool2d_backward: fn(&Tensor, &Tensor, usize, usize, usize) -> Tensor,
+    /// Two-dimensional batch normalization forward.
+    #[allow(clippy::too_many_arguments)]
+    pub batchnorm: fn(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, bool, f32, f32) -> Tensor,
+    /// Two-dimensional batch normalization backward.
+    #[allow(clippy::too_many_arguments)]
+    pub batchnorm_backward: fn(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, bool, f32) -> (Tensor, Tensor, Tensor),
 }
 
 /// Per-backend registry of op implementations, indexed by [`Device::backend_idx`].
@@ -1119,6 +1150,23 @@ pub fn set_autograd_enabled(enabled: bool) {
 #[must_use]
 pub fn is_autograd_enabled() -> bool {
     AUTOGRAD_ENABLED.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// Thread-local flag for training (vs evaluation) mode; consulted by layers
+    /// like dropout that behave differently at train and eval time. Defaults to true.
+    static TRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Sets whether the current thread is in training mode (vs evaluation).
+pub fn set_training(training: bool) {
+    TRAINING.with(|t| t.set(training));
+}
+
+/// Returns whether the current thread is in training mode.
+#[must_use]
+pub fn is_training() -> bool {
+    TRAINING.with(std::cell::Cell::get)
 }
 
 /// Function pointer signature for autograd tape recording hook.
@@ -1155,10 +1203,10 @@ pub fn register_grad_hook(f: GradFn) {
 }
 
 /// Global registry for the autograd drop cleanup hook.
-pub static DROP_HOOK: std::sync::OnceLock<fn(StorageId)> = std::sync::OnceLock::new();
+pub static DROP_HOOK: std::sync::OnceLock<fn(StorageId, Device)> = std::sync::OnceLock::new();
 
 /// Registers the autograd drop cleanup hook.
-pub fn register_drop_hook(f: fn(StorageId)) {
+pub fn register_drop_hook(f: fn(StorageId, Device)) {
     let _ = DROP_HOOK.set(f);
 }
 
@@ -1636,6 +1684,126 @@ impl Tensor {
             .get()
             .expect("No backend registered for this device. Did you call the backend's init()?");
         (ops.maxpool2d_backward)(self, grad_out, kernel_size, stride, padding)
+    }
+
+    /// Two-dimensional average pooling over the spatial dimensions of a 4D tensor.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn avgpool2d(&self, kernel_size: usize, stride: usize, padding: usize) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.avgpool2d)(self, kernel_size, stride, padding);
+
+        if is_autograd_enabled() && self.requires_grad() {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record(
+                    &format!("avgpool2d_{kernel_size}_{stride}_{padding}"),
+                    &[self],
+                    &mut out,
+                );
+            }
+        }
+
+        out
+    }
+
+    /// Backward for [`avgpool2d`](Self::avgpool2d): returns the gradient w.r.t. the input.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn avgpool2d_backward(
+        &self,
+        grad_out: &Self,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.avgpool2d_backward)(self, grad_out, kernel_size, stride, padding)
+    }
+
+    /// Two-dimensional batch normalization (forward).
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn batchnorm(
+        &self,
+        gamma: &Self,
+        beta: &Self,
+        running_mean: &Self,
+        running_var: &Self,
+        training: bool,
+        momentum: f32,
+        eps: f32,
+    ) -> Self {
+        assert_eq!(self.device(), gamma.device(), "Tensors must reside on the same device");
+        assert_eq!(self.device(), beta.device(), "Tensors must reside on the same device");
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.batchnorm)(
+            self,
+            gamma,
+            beta,
+            running_mean,
+            running_var,
+            training,
+            momentum,
+            eps,
+        );
+
+        if is_autograd_enabled() && (self.requires_grad() || gamma.requires_grad() || beta.requires_grad()) {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                record(
+                    &format!("batchnorm_{training}_{eps}"),
+                    &[self, gamma, beta, running_mean, running_var],
+                    &mut out,
+                );
+            }
+        }
+
+        out
+    }
+
+    /// Two-dimensional batch normalization backward.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn batchnorm_backward(
+        &self,
+        gamma: &Self,
+        beta: &Self,
+        running_mean: &Self,
+        running_var: &Self,
+        grad_out: &Self,
+        training: bool,
+        eps: f32,
+    ) -> (Self, Self, Self) {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.batchnorm_backward)(
+            self,
+            gamma,
+            beta,
+            running_mean,
+            running_var,
+            grad_out,
+            training,
+            eps,
+        )
     }
 }
 

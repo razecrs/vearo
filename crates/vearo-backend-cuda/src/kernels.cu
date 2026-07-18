@@ -557,7 +557,7 @@ extern "C" __global__ void conv2d_backward_weight(
 }
 
 // grad_input[nn,c,p,q] = sum of grad_out * weight over the (co, y, x_out, i, j)
-// whose receptive field lands on (p,q). Loop order co,y,x_out,i,j matches CPU.
+// whose receptive field lands on (p,q). Optimized by inverse index mapping.
 extern "C" __global__ void conv2d_backward_input(
     const float* weight, const float* grad_out, float* grad_in, const int* p
 ) {
@@ -575,21 +575,21 @@ extern "C" __global__ void conv2d_backward_input(
 
     float acc = 0.0f;
     for (int co = 0; co < cout; ++co) {
-        for (int y = 0; y < oh; ++y) {
-            for (int x_out = 0; x_out < ow; ++x_out) {
-                for (int i = 0; i < kh; ++i) {
-                    int ih = y * stride + i;
-                    if (ih < padding || ih >= h + padding) continue;
-                    if (ih - padding != pp) continue;
-                    for (int j = 0; j < kw; ++j) {
-                        int iw = x_out * stride + j;
-                        if (iw < padding || iw >= w + padding) continue;
-                        if (iw - padding != q) continue;
-                        int w_idx = ((co * cin + c) * kh + i) * kw + j;
-                        float g = grad_out[((nn * cout + co) * oh + y) * ow + x_out];
-                        acc = fmaf(g, weight[w_idx], acc);
-                    }
-                }
+        for (int i = 0; i < kh; ++i) {
+            int y_stride = pp + padding - i;
+            if (y_stride < 0 || y_stride % stride != 0) continue;
+            int y = y_stride / stride;
+            if (y >= oh) continue;
+
+            for (int j = 0; j < kw; ++j) {
+                int x_stride = q + padding - j;
+                if (x_stride < 0 || x_stride % stride != 0) continue;
+                int x_out = x_stride / stride;
+                if (x_out >= ow) continue;
+
+                int w_idx = ((co * cin + c) * kh + i) * kw + j;
+                float g = grad_out[((nn * cout + co) * oh + y) * ow + x_out];
+                acc = fmaf(g, weight[w_idx], acc);
             }
         }
     }
@@ -672,4 +672,279 @@ extern "C" __global__ void maxpool2d_backward(
         }
     }
     grad_in[idx] = acc;
+}
+
+// Average pooling (NCHW). Averages over valid (non-padded) positions only.
+// p: [n, c, h, w, k, oh, ow, stride, padding].
+extern "C" __global__ void avgpool2d_forward(
+    const float* x, float* out, const int* p
+) {
+    int n = p[0], c = p[1], h = p[2], w = p[3], k = p[4];
+    int oh = p[5], ow = p[6], stride = p[7], padding = p[8];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * c * oh * ow) return;
+
+    int x_out = idx % ow;
+    int y = (idx / ow) % oh;
+    int cc = (idx / (ow * oh)) % c;
+    int nn = idx / (ow * oh * c);
+
+    float sum = 0.0f;
+    int count = 0;
+    for (int i = 0; i < k; ++i) {
+        int ih = y * stride + i;
+        if (ih < padding || ih >= h + padding) continue;
+        int iha = ih - padding;
+        for (int j = 0; j < k; ++j) {
+            int iw = x_out * stride + j;
+            if (iw < padding || iw >= w + padding) continue;
+            int iwa = iw - padding;
+            sum += x[((nn * c + cc) * h + iha) * w + iwa];
+            count++;
+        }
+    }
+    out[((nn * c + cc) * oh + y) * ow + x_out] = sum / (float)count;
+}
+
+// Backward: split each output gradient evenly across its window's valid positions.
+extern "C" __global__ void avgpool2d_backward(
+    const float* grad_out, float* grad_in, const int* p
+) {
+    int n = p[0], c = p[1], h = p[2], w = p[3], k = p[4];
+    int oh = p[5], ow = p[6], stride = p[7], padding = p[8];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * c * h * w) return;
+
+    int qq = idx % w;
+    int pp = (idx / w) % h;
+    int cc = (idx / (w * h)) % c;
+    int nn = idx / (w * h * c);
+
+    float acc = 0.0f;
+    for (int y = 0; y < oh; ++y) {
+        int i = pp + padding - y * stride;
+        if (i < 0 || i >= k) continue;
+        for (int x_out = 0; x_out < ow; ++x_out) {
+            int j = qq + padding - x_out * stride;
+            if (j < 0 || j >= k) continue;
+            int count = 0;
+            for (int a = 0; a < k; ++a) {
+                int ih = y * stride + a;
+                if (ih < padding || ih >= h + padding) continue;
+                for (int b = 0; b < k; ++b) {
+                    int iw = x_out * stride + b;
+                    if (iw < padding || iw >= w + padding) continue;
+                    count++;
+                }
+            }
+            acc += grad_out[((nn * c + cc) * oh + y) * ow + x_out] / (float)count;
+        }
+    }
+    grad_in[idx] = acc;
+}
+
+// 2D Batch Normalization forward (NCHW).
+extern "C" __global__ void batchnorm_forward(
+    const float* x,
+    const float* gamma,
+    const float* beta,
+    float* running_mean,
+    float* running_var,
+    float* out,
+    const float* p
+) {
+    int N = (int)p[0];
+    int C = (int)p[1];
+    int H = (int)p[2];
+    int W = (int)p[3];
+    int training = (int)p[4];
+    float momentum = p[5];
+    float eps = p[6];
+
+    int cc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cc >= C) return;
+
+    float m = (float)(N * H * W);
+
+    if (training) {
+        // 1. Calculate mean for channel cc
+        float sum = 0.0f;
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    sum += x[((nn * C + cc) * H + hh) * W + ww];
+                }
+            }
+        }
+        float mean = sum / m;
+
+        // 2. Calculate variance for channel cc
+        float sum_sq = 0.0f;
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    float diff = x[((nn * C + cc) * H + hh) * W + ww] - mean;
+                    sum_sq += diff * diff;
+                }
+            }
+        }
+        float var = sum_sq / m;
+
+        // 3. Update running stats (momentum)
+        running_mean[cc] = (1.0f - momentum) * running_mean[cc] + momentum * mean;
+        float bessel = (m > 1.0f) ? (m / (m - 1.0f)) : 1.0f;
+        running_var[cc] = (1.0f - momentum) * running_var[cc] + momentum * var * bessel;
+
+        // 4. Normalize, scale, and shift
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float gamma_val = gamma[cc];
+        float beta_val = beta[cc];
+
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    int idx = ((nn * C + cc) * H + hh) * W + ww;
+                    float x_hat = (x[idx] - mean) * inv_std;
+                    out[idx] = x_hat * gamma_val + beta_val;
+                }
+            }
+        }
+    } else {
+        // Eval mode
+        float mean = running_mean[cc];
+        float var = running_var[cc];
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float gamma_val = gamma[cc];
+        float beta_val = beta[cc];
+
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    int idx = ((nn * C + cc) * H + hh) * W + ww;
+                    float x_hat = (x[idx] - mean) * inv_std;
+                    out[idx] = x_hat * gamma_val + beta_val;
+                }
+            }
+        }
+    }
+}
+
+// 2D Batch Normalization backward (NCHW).
+extern "C" __global__ void batchnorm_backward(
+    const float* x,
+    const float* gamma,
+    const float* beta,
+    const float* running_mean,
+    const float* running_var,
+    const float* grad_out,
+    float* grad_in,
+    float* grad_weight,
+    float* grad_bias,
+    const float* p
+) {
+    int N = (int)p[0];
+    int C = (int)p[1];
+    int H = (int)p[2];
+    int W = (int)p[3];
+    int training = (int)p[4];
+    float eps = p[5];
+
+    int cc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cc >= C) return;
+
+    float m = (float)(N * H * W);
+
+    if (training) {
+        // 1. Recompute mean and variance
+        float sum = 0.0f;
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    sum += x[((nn * C + cc) * H + hh) * W + ww];
+                }
+            }
+        }
+        float mean = sum / m;
+
+        float sum_sq = 0.0f;
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    float diff = x[((nn * C + cc) * H + hh) * W + ww] - mean;
+                    sum_sq += diff * diff;
+                }
+            }
+        }
+        float var = sum_sq / m;
+
+        // 2. Compute grad_bias and grad_weight
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float sum_dy = 0.0f;
+        float sum_dy_xhat = 0.0f;
+
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    int idx = ((nn * C + cc) * H + hh) * W + ww;
+                    float dy = grad_out[idx];
+                    float x_hat = (x[idx] - mean) * inv_std;
+                    sum_dy += dy;
+                    sum_dy_xhat += dy * x_hat;
+                }
+            }
+        }
+
+        grad_bias[cc] = sum_dy;
+        grad_weight[cc] = sum_dy_xhat;
+
+        // 3. Compute grad_in
+        float gamma_val = gamma[cc];
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    int idx = ((nn * C + cc) * H + hh) * W + ww;
+                    float dy = grad_out[idx];
+                    float x_hat = (x[idx] - mean) * inv_std;
+                    float gx = (gamma_val * inv_std / m) * (m * dy - sum_dy - x_hat * sum_dy_xhat);
+                    grad_in[idx] = gx;
+                }
+            }
+        }
+    } else {
+        // Eval mode backward
+        float mean = running_mean[cc];
+        float var = running_var[cc];
+        float inv_std = 1.0f / sqrtf(var + eps);
+
+        float sum_dy = 0.0f;
+        float sum_dy_xhat = 0.0f;
+
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    int idx = ((nn * C + cc) * H + hh) * W + ww;
+                    float dy = grad_out[idx];
+                    float x_hat = (x[idx] - mean) * inv_std;
+                    sum_dy += dy;
+                    sum_dy_xhat += dy * x_hat;
+                }
+            }
+        }
+
+        grad_bias[cc] = sum_dy;
+        grad_weight[cc] = sum_dy_xhat;
+
+        float gamma_val = gamma[cc];
+        for (int nn = 0; nn < N; ++nn) {
+            for (int hh = 0; hh < H; ++hh) {
+                for (int ww = 0; ww < W; ++ww) {
+                    int idx = ((nn * C + cc) * H + hh) * W + ww;
+                    float dy = grad_out[idx];
+                    grad_in[idx] = dy * gamma_val * inv_std;
+                }
+            }
+        }
+    }
 }

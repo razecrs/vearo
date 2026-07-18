@@ -11,6 +11,7 @@ use vearo_core::Tensor;
 /// A simple deterministic random number generator.
 ///
 /// Uses an LCG or Xorshift structure to avoid pulling in external `rand` dependencies.
+#[derive(Clone)]
 pub struct SimpleRng {
     state: u64,
 }
@@ -260,6 +261,180 @@ impl Module for MaxPool2d {
 
     fn parameters(&self) -> Vec<Tensor> {
         Vec::new()
+    }
+}
+
+/// A 2D average-pooling layer (no learnable parameters).
+pub struct AvgPool2d {
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+}
+
+impl AvgPool2d {
+    /// Creates a new average-pooling layer with the given window, stride, and padding.
+    #[must_use]
+    pub fn new(kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            kernel_size,
+            stride,
+            padding,
+        }
+    }
+
+    /// Device move; a no-op since average pooling holds no parameters.
+    #[must_use]
+    pub fn to(&self, _device: vearo_core::Device) -> Self {
+        Self::new(self.kernel_size, self.stride, self.padding)
+    }
+}
+
+impl Module for AvgPool2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        input.avgpool2d(self.kernel_size, self.stride, self.padding)
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        Vec::new()
+    }
+}
+
+/// A dropout layer.
+///
+/// In training mode it zeroes each activation with probability `p` and scales the
+/// survivors by `1/(1-p)`; in eval mode it is the identity. The mask is generated
+/// on the host from a seeded RNG, so results are reproducible and bit-identical
+/// across the CPU and CUDA backends.
+pub struct Dropout {
+    p: f32,
+    rng: std::cell::RefCell<SimpleRng>,
+}
+
+impl Dropout {
+    /// Creates a new dropout layer with drop probability `p`, seeded for reproducibility.
+    #[must_use]
+    pub fn new(p: f32, seed: u64) -> Self {
+        Self {
+            p,
+            rng: std::cell::RefCell::new(SimpleRng::new(seed)),
+        }
+    }
+
+    /// Device move; dropout holds no device parameters (the mask is built per forward).
+    #[must_use]
+    pub fn to(&self, _device: vearo_core::Device) -> Self {
+        Self {
+            p: self.p,
+            rng: std::cell::RefCell::new(self.rng.borrow().clone()),
+        }
+    }
+}
+
+impl Module for Dropout {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        if self.p <= 0.0 || !vearo_core::is_training() {
+            return input.clone();
+        }
+        let scale = 1.0 / (1.0 - self.p);
+        let numel = input.shape().numel();
+        let mask: Vec<f32> = {
+            let mut rng = self.rng.borrow_mut();
+            (0..numel)
+                .map(|_| if rng.next_f32() >= self.p { scale } else { 0.0 })
+                .collect()
+        };
+        let mask_t = Tensor::from_f32(&mask, *input.shape()).to(input.device());
+        input.mul(&mask_t)
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        Vec::new()
+    }
+}
+
+/// A 2D batch normalization layer (BatchNorm2d).
+pub struct BatchNorm2d {
+    /// Learnable scale parameter of shape `[C]`.
+    pub weight: Tensor,
+    /// Learnable bias parameter of shape `[C]`.
+    pub bias: Tensor,
+    /// Running mean buffer of shape `[C]` (mutated during forward via RefCell).
+    pub running_mean: std::cell::RefCell<Tensor>,
+    /// Running variance buffer of shape `[C]` (mutated during forward via RefCell).
+    pub running_var: std::cell::RefCell<Tensor>,
+    /// Momentum factor for updating running stats.
+    pub momentum: f32,
+    /// Epsilon value for numerical stability.
+    pub eps: f32,
+}
+
+impl BatchNorm2d {
+    /// Creates a new BatchNorm2d layer.
+    ///
+    /// Gamma (weight) is initialized to 1.0, beta (bias) to 0.0.
+    /// Running mean is initialized to 0.0, running variance to 1.0.
+    #[must_use]
+    pub fn new(num_features: usize, momentum: f32, eps: f32) -> Self {
+        let weight = Tensor::from_f32(&vec![1.0; num_features], [num_features]);
+        weight.set_requires_grad(true);
+        let bias = Tensor::from_f32(&vec![0.0; num_features], [num_features]);
+        bias.set_requires_grad(true);
+
+        let running_mean = Tensor::from_f32(&vec![0.0; num_features], [num_features]);
+        let running_var = Tensor::from_f32(&vec![1.0; num_features], [num_features]);
+
+        Self {
+            weight,
+            bias,
+            running_mean: std::cell::RefCell::new(running_mean),
+            running_var: std::cell::RefCell::new(running_var),
+            momentum,
+            eps,
+        }
+    }
+
+    /// Move the layer parameters and buffers to a different device.
+    #[must_use]
+    pub fn to(&self, device: vearo_core::Device) -> Self {
+        let weight = self.weight.to(device);
+        let bias = self.bias.to(device);
+        let running_mean = self.running_mean.borrow().to(device);
+        let running_var = self.running_var.borrow().to(device);
+
+        Self {
+            weight,
+            bias,
+            running_mean: std::cell::RefCell::new(running_mean),
+            running_var: std::cell::RefCell::new(running_var),
+            momentum: self.momentum,
+            eps: self.eps,
+        }
+    }
+}
+
+impl Module for BatchNorm2d {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        let rm = self.running_mean.borrow().clone();
+        let rv = self.running_var.borrow().clone();
+
+        let out = input.batchnorm(
+            &self.weight,
+            &self.bias,
+            &rm,
+            &rv,
+            vearo_core::is_training(),
+            self.momentum,
+            self.eps,
+        );
+
+        *self.running_mean.borrow_mut() = rm;
+        *self.running_var.borrow_mut() = rv;
+
+        out
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![self.weight.clone(), self.bias.clone()]
     }
 }
 

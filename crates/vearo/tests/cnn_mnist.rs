@@ -94,6 +94,7 @@ fn run_cnn(device: Device) -> f32 {
 }
 
 #[test]
+#[ignore = "needs data/mnist_train.csv (see README); not shipped in the repo"]
 fn test_cnn_overfits_mnist_cpu() {
     vearo::init();
     let acc = run_cnn(Device::Cpu);
@@ -101,6 +102,7 @@ fn test_cnn_overfits_mnist_cpu() {
 }
 
 #[test]
+#[ignore = "needs data/mnist_train.csv (see README); not shipped in the repo"]
 fn test_cnn_overfits_mnist_cuda() {
     vearo::init();
     let acc = run_cnn(Device::Cuda(0));
@@ -173,6 +175,7 @@ fn run_cnn_pool(device: Device) -> f32 {
 }
 
 #[test]
+#[ignore = "needs data/mnist_train.csv (see README); not shipped in the repo"]
 fn test_cnn_maxpool_overfits_cpu() {
     vearo::init();
     let acc = run_cnn_pool(Device::Cpu);
@@ -180,6 +183,7 @@ fn test_cnn_maxpool_overfits_cpu() {
 }
 
 #[test]
+#[ignore = "needs data/mnist_train.csv (see README); not shipped in the repo"]
 fn test_cnn_maxpool_overfits_cuda() {
     vearo::init();
     let acc = run_cnn_pool(Device::Cuda(0));

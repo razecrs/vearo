@@ -6,7 +6,7 @@
     clippy::too_many_arguments
 )]
 
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use vearo_core::{
     BackendOps, DType, Device, Shape, StorageId, Tensor, register_backend_ops, register_cuda_hooks,
@@ -31,6 +31,11 @@ pub struct CudaSlot {
 pub static CUDA_SLOTS: LazyLock<Mutex<Vec<Option<CudaSlot>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 pub static FREE_CUDA_SLOTS: LazyLock<Mutex<Vec<u32>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+pub static PEAK_CUDA_MEM_BYTES: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
+
+pub fn get_peak_memory() -> usize {
+    *PEAK_CUDA_MEM_BYTES.lock().unwrap()
+}
 
 pub fn cuda_alloc(numel: usize) -> StorageId {
     let dev = get_cuda_device();
@@ -40,6 +45,18 @@ pub fn cuda_alloc(numel: usize) -> StorageId {
 
     let mut slots = CUDA_SLOTS.lock().unwrap();
     let mut free = FREE_CUDA_SLOTS.lock().unwrap();
+
+    // Calculate current total memory allocated
+    let mut current_total = 0;
+    for s in slots.iter().flatten() {
+        current_total += s.slice.len() * 4;
+    }
+    current_total += numel * 4;
+
+    let mut peak = PEAK_CUDA_MEM_BYTES.lock().unwrap();
+    if current_total > *peak {
+        *peak = current_total;
+    }
 
     let slot = CudaSlot {
         slice,
@@ -149,6 +166,10 @@ pub fn init() {
                 "conv2d_backward_input",
                 "maxpool2d_forward",
                 "maxpool2d_backward",
+                "avgpool2d_forward",
+                "avgpool2d_backward",
+                "batchnorm_forward",
+                "batchnorm_backward",
             ],
         )
         .expect("Failed to load Vearo CUDA kernels");
@@ -177,6 +198,10 @@ pub fn init() {
             conv2d_backward,
             maxpool2d,
             maxpool2d_backward,
+            avgpool2d,
+            avgpool2d_backward,
+            batchnorm,
+            batchnorm_backward,
         },
     );
 }
@@ -490,6 +515,250 @@ pub fn maxpool2d_backward(
             .unwrap();
     }
     grad_in
+}
+
+/// 2D average pooling (NCHW) on CUDA. Bit-matches the CPU backend.
+pub fn avgpool2d(input: &Tensor, kernel_size: usize, stride: usize, padding: usize) -> Tensor {
+    let dev = get_cuda_device();
+    let input = input.contiguous();
+    let id = input.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let oh = (h + 2 * padding - kernel_size) / stride + 1;
+    let ow = (w + 2 * padding - kernel_size) / stride + 1;
+    let out_shape = Shape::new([n, c, oh, ow]);
+    let out_storage = cuda_alloc(out_shape.numel());
+    let out = Tensor::from_components(
+        out_storage,
+        out_shape,
+        out_shape.contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let p = maxpool_params(n, c, h, w, kernel_size, oh, ow, stride, padding);
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[input.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let out_slice = &slots[out_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "avgpool2d_forward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(out_shape.numel() as u32);
+    unsafe {
+        func.launch(cfg, (x_slice, out_slice, &p_dev)).unwrap();
+    }
+    out
+}
+
+/// Backward for [`avgpool2d`] on CUDA: returns grad input. Bit-matches the CPU backend.
+pub fn avgpool2d_backward(
+    input: &Tensor,
+    grad_out: &Tensor,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    let dev = get_cuda_device();
+    let grad_out = grad_out.contiguous();
+    let id = input.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let gd = grad_out.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let gi_storage = cuda_alloc(input.shape().numel());
+    let grad_in = Tensor::from_components(
+        gi_storage,
+        *input.shape(),
+        input.shape().contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    if input.shape().numel() == 0 {
+        return grad_in;
+    }
+
+    let p = maxpool_params(n, c, h, w, kernel_size, oh, ow, stride, padding);
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let go_slice = &slots[grad_out.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let gi_slice = &slots[gi_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "avgpool2d_backward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(input.shape().numel() as u32);
+    unsafe {
+        func.launch(cfg, (go_slice, gi_slice, &p_dev)).unwrap();
+    }
+    grad_in
+}
+
+/// 2D batch normalization (NCHW) on CUDA. Bit-matches the CPU backend.
+pub fn batchnorm(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    running_mean: &Tensor,
+    running_var: &Tensor,
+    training: bool,
+    momentum: f32,
+    eps: f32,
+) -> Tensor {
+    let dev = get_cuda_device();
+    let x = x.contiguous();
+    let dims = x.shape().dims();
+    let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+
+    let out_storage = cuda_alloc(x.shape().numel());
+    let out = Tensor::from_components(
+        out_storage,
+        *x.shape(),
+        x.shape().contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+    if x.shape().numel() == 0 {
+        return out;
+    }
+
+    let p = vec![
+        n as f32,
+        c as f32,
+        h as f32,
+        w as f32,
+        if training { 1.0f32 } else { 0.0f32 },
+        momentum,
+        eps,
+    ];
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[x.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let gamma_slice = &slots[gamma.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let beta_slice = &slots[beta.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let rm_slice = &slots[running_mean.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let rv_slice = &slots[running_var.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let out_slice = &slots[out_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "batchnorm_forward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(c as u32);
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                x_slice,
+                gamma_slice,
+                beta_slice,
+                rm_slice,
+                rv_slice,
+                out_slice,
+                &p_dev,
+            ),
+        )
+        .unwrap();
+    }
+    out
+}
+
+/// Backward for [`batchnorm`] on CUDA: returns (grad input, grad weight, grad bias). Bit-matches the CPU backend.
+pub fn batchnorm_backward(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    running_mean: &Tensor,
+    running_var: &Tensor,
+    grad_out: &Tensor,
+    training: bool,
+    eps: f32,
+) -> (Tensor, Tensor, Tensor) {
+    let dev = get_cuda_device();
+    let x = x.contiguous();
+    let grad_out = grad_out.contiguous();
+    let dims = x.shape().dims();
+    let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+
+    let gi_storage = cuda_alloc(x.shape().numel());
+    let grad_in = Tensor::from_components(
+        gi_storage,
+        *x.shape(),
+        x.shape().contiguous_strides(),
+        DType::F32,
+        Device::Cuda(0),
+    );
+
+    let gw_storage = cuda_alloc(c);
+    let grad_w = Tensor::from_components(
+        gw_storage,
+        Shape::new([c]),
+        Shape::new([1]),
+        DType::F32,
+        Device::Cuda(0),
+    );
+
+    let gb_storage = cuda_alloc(c);
+    let grad_b = Tensor::from_components(
+        gb_storage,
+        Shape::new([c]),
+        Shape::new([1]),
+        DType::F32,
+        Device::Cuda(0),
+    );
+
+    if x.shape().numel() == 0 {
+        return (grad_in, grad_w, grad_b);
+    }
+
+    let p = vec![
+        n as f32,
+        c as f32,
+        h as f32,
+        w as f32,
+        if training { 1.0f32 } else { 0.0f32 },
+        eps,
+    ];
+    let p_dev = dev.htod_copy(p).unwrap();
+
+    let slots = CUDA_SLOTS.lock().unwrap();
+    let x_slice = &slots[x.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let gamma_slice = &slots[gamma.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let beta_slice = &slots[beta.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let rm_slice = &slots[running_mean.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let rv_slice = &slots[running_var.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let go_slice = &slots[grad_out.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+
+    let gi_slice = &slots[gi_storage.slot_idx as usize].as_ref().unwrap().slice;
+    let gw_slice = &slots[gw_storage.slot_idx as usize].as_ref().unwrap().slice;
+    let gb_slice = &slots[gb_storage.slot_idx as usize].as_ref().unwrap().slice;
+
+    let func = dev.get_func("vearo_kernels", "batchnorm_backward").unwrap();
+    let cfg = LaunchConfig::for_num_elems(c as u32);
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                x_slice,
+                gamma_slice,
+                beta_slice,
+                rm_slice,
+                rv_slice,
+                go_slice,
+                gi_slice,
+                gw_slice,
+                gb_slice,
+                &p_dev,
+            ),
+        )
+        .unwrap();
+    }
+    (grad_in, grad_w, grad_b)
 }
 
 fn binary_op(lhs: &Tensor, rhs: &Tensor, kernel_name: &str) -> Tensor {
@@ -1507,6 +1776,44 @@ mod tests {
                 .to(Device::Cpu)
                 .to_vec_f32();
             assert!(maxdiff(&gi_c, &gi_g) < 1e-4, "maxpool bwd k{k}s{stride}p{padding}");
+        }
+    }
+
+    /// avgpool2d forward + backward must match the CPU backend.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_cuda_avgpool2d_parity() {
+        setup();
+        vearo_core::set_autograd_enabled(false);
+        let cuda = Device::Cuda(0);
+
+        let mk = |numel: usize, seed: f32| -> Vec<f32> {
+            (0..numel).map(|i| (i as f32 * seed + seed).sin()).collect()
+        };
+        let maxdiff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+
+        for &(k, stride, padding) in &[(2usize, 2usize, 0usize), (3usize, 2usize, 1usize)] {
+            let (n, c, h, w) = (2usize, 3usize, 6usize, 6usize);
+            let oh = (h + 2 * padding - k) / stride + 1;
+            let ow = (w + 2 * padding - k) / stride + 1;
+
+            let x = Tensor::from_f32(&mk(n * c * h * w, 0.3), [n, c, h, w]);
+            let go = Tensor::from_f32(&mk(n * c * oh * ow, 0.5), [n, c, oh, ow]);
+            let xg = x.to(cuda);
+            let gog = go.to(cuda);
+
+            let fwd_c = x.avgpool2d(k, stride, padding).to_vec_f32();
+            let fwd_g = xg.avgpool2d(k, stride, padding).to(Device::Cpu).to_vec_f32();
+            assert!(maxdiff(&fwd_c, &fwd_g) < 1e-4, "avgpool fwd k{k}s{stride}p{padding}");
+
+            let gi_c = x.avgpool2d_backward(&go, k, stride, padding).to_vec_f32();
+            let gi_g = xg
+                .avgpool2d_backward(&gog, k, stride, padding)
+                .to(Device::Cpu)
+                .to_vec_f32();
+            assert!(maxdiff(&gi_c, &gi_g) < 1e-4, "avgpool bwd k{k}s{stride}p{padding}");
         }
     }
 }

@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use vearo_core::{
-    DType, Shape, StorageId, Tensor, is_autograd_enabled, register_backward_hook,
+    DType, Device, Shape, StorageId, Tensor, is_autograd_enabled, register_backward_hook,
     register_grad_hook, register_record_op, set_autograd_enabled,
 };
 
@@ -84,6 +84,22 @@ pub enum OpType {
         stride: usize,
         /// Zero-padding (treated as -inf) applied to each spatial side.
         padding: usize,
+    },
+    /// Two-dimensional average pooling.
+    AvgPool2d {
+        /// Pooling window size.
+        kernel_size: usize,
+        /// Pooling stride.
+        stride: usize,
+        /// Zero-padding applied to each spatial side.
+        padding: usize,
+    },
+    /// Two-dimensional batch normalization.
+    BatchNorm {
+        /// Whether batch normalization is in training mode.
+        training: bool,
+        /// Numerical stability epsilon represented as bits.
+        eps_bits: u32,
     },
 }
 
@@ -174,7 +190,11 @@ thread_local! {
     pub static TAPE: RefCell<Tape> = RefCell::new(Tape::default());
 
     /// Thread-local storage for computed gradients after backward pass.
-    pub static GRADIENTS: RefCell<HashMap<StorageId, Tensor>> = RefCell::new(HashMap::default());
+    /// Keyed by (`StorageId`, `Device`): CPU and CUDA have independent id spaces that
+    /// overlap numerically, so a bare `StorageId` would let one device's tensor evict
+    /// the other's gradient.
+    pub static GRADIENTS: RefCell<HashMap<(StorageId, Device), Tensor>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Parses a `"<dim>_<keepbit>"` reduction op-name suffix into `(dim, keep_dim)`.
@@ -228,6 +248,24 @@ fn record_op_callback(op_name: &str, inputs: &[&Tensor], output: &mut Tensor) {
             kernel_size,
             stride,
             padding,
+        }
+    } else if let Some(stripped) = op_name.strip_prefix("avgpool2d_") {
+        let parts: Vec<&str> = stripped.split('_').collect();
+        let kernel_size = parts[0].parse::<usize>().unwrap();
+        let stride = parts[1].parse::<usize>().unwrap();
+        let padding = parts[2].parse::<usize>().unwrap();
+        OpType::AvgPool2d {
+            kernel_size,
+            stride,
+            padding,
+        }
+    } else if let Some(stripped) = op_name.strip_prefix("batchnorm_") {
+        let parts: Vec<&str> = stripped.split('_').collect();
+        let training = parts[0].parse::<bool>().unwrap();
+        let eps = parts[1].parse::<f32>().unwrap();
+        OpType::BatchNorm {
+            training,
+            eps_bits: eps.to_bits(),
         }
     } else {
         match op_name {
@@ -502,6 +540,22 @@ fn backward_callback(output: &Tensor) {
                 let (gx, gw, gb) = x.layernorm_backward(weight, bias, &grad_out, eps);
                 vec![gx, gw, gb]
             }
+            OpType::BatchNorm { training, eps_bits } => {
+                let x = &node.saved_tensors[0];
+                let gamma = &node.saved_tensors[1];
+                let beta = &node.saved_tensors[2];
+                let running_mean = &node.saved_tensors[3];
+                let running_var = &node.saved_tensors[4];
+                let eps = f32::from_bits(*eps_bits);
+                let (gx, gw, gb) = x.batchnorm_backward(gamma, beta, running_mean, running_var, &grad_out, *training, eps);
+                vec![
+                    gx,
+                    gw,
+                    gb,
+                    Tensor::zeros(*running_mean.shape(), vearo_core::DType::F32).to(running_mean.device()),
+                    Tensor::zeros(*running_var.shape(), vearo_core::DType::F32).to(running_var.device()),
+                ]
+            }
             OpType::Embedding => {
                 let x = &node.saved_tensors[0];
                 let weight = &node.saved_tensors[1];
@@ -527,6 +581,15 @@ fn backward_callback(output: &Tensor) {
             } => {
                 let input = &node.saved_tensors[0];
                 let gi = input.maxpool2d_backward(&grad_out, *kernel_size, *stride, *padding);
+                vec![gi]
+            }
+            OpType::AvgPool2d {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let input = &node.saved_tensors[0];
+                let gi = input.avgpool2d_backward(&grad_out, *kernel_size, *stride, *padding);
                 vec![gi]
             }
             OpType::Sum { dim, keep_dim } => {
@@ -578,7 +641,7 @@ fn backward_callback(output: &Tensor) {
                 };
 
                 if let Some(grad_tensor) = grad_opt {
-                    g.insert(input.storage_id(), grad_tensor.clone());
+                    g.insert((input.storage_id(), input.device()), grad_tensor.clone());
                 }
             }
         }
@@ -596,7 +659,7 @@ fn grad_callback(tensor: &Tensor) -> Option<Tensor> {
     GRADIENTS
         .try_with(|g| {
             g.try_borrow()
-                .map(|g_ref| g_ref.get(&tensor.storage_id()).cloned())
+                .map(|g_ref| g_ref.get(&(tensor.storage_id(), tensor.device())).cloned())
                 .ok()
                 .flatten()
         })
@@ -605,10 +668,10 @@ fn grad_callback(tensor: &Tensor) -> Option<Tensor> {
 }
 
 /// Dynamic drop cleanup callback.
-fn drop_callback(storage_id: StorageId) {
+fn drop_callback(storage_id: StorageId, device: Device) {
     let _ = GRADIENTS.try_with(|g| {
         if let Ok(mut g_ref) = g.try_borrow_mut() {
-            g_ref.remove(&storage_id);
+            g_ref.remove(&(storage_id, device));
         }
     });
 }
@@ -1037,6 +1100,41 @@ mod tests {
             assert!(
                 diff <= 1e-2,
                 "Mismatch on maxpool2d at index {}: ana={}, num={}",
+                i,
+                grad_ana.get_f32(i),
+                grad_num.get_f32(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_autograd_avgpool2d() {
+        vearo_backend_cpu::init();
+        init();
+
+        let vals = [
+            0.3, 0.9, 0.1, 0.7, 0.8, 0.2, 0.6, 0.4, 0.5, 1.1, 0.05, 0.95, 0.15, 0.75, 0.25, 0.65,
+        ];
+        let x = Tensor::from_f32(&vals, [1, 1, 4, 4]);
+        x.set_requires_grad(true);
+
+        let forward = |t_x: &Tensor| {
+            let out = t_x.avgpool2d(2, 2, 0); // [1,1,2,2]
+            out.reshape([4]).sum(0, false)
+        };
+
+        let out = forward(&x);
+        out.backward();
+        let grad_ana = x.grad().unwrap();
+
+        TAPE.with(|t| t.borrow_mut().reset());
+        let grad_num = numerical_grad(forward, &x, 1e-4);
+
+        for i in 0..16 {
+            let diff = (grad_ana.get_f32(i) - grad_num.get_f32(i)).abs();
+            assert!(
+                diff <= 1e-2,
+                "Mismatch on avgpool2d at index {}: ana={}, num={}",
                 i,
                 grad_ana.get_f32(i),
                 grad_num.get_f32(i)

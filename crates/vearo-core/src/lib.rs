@@ -17,9 +17,10 @@ pub use storage::{
     CpuArenaShard, CpuStorage, NUM_SHARDS, StorageId, current_thread_shard_idx, get_cpu_shard,
 };
 pub use tensor::{
-    BackendOps, BackwardFn, GradFn, RecordOpFn, Tensor, is_autograd_enabled, register_backend_ops,
-    register_backward_hook, register_cuda_hooks, register_drop_hook, register_grad_hook,
-    register_record_op, register_refcount_dec, register_refcount_inc, set_autograd_enabled,
+    BackendOps, BackwardFn, GradFn, RecordOpFn, Tensor, is_autograd_enabled, is_training,
+    register_backend_ops, register_backward_hook, register_cuda_hooks, register_drop_hook,
+    register_grad_hook, register_record_op, register_refcount_dec, register_refcount_inc,
+    set_autograd_enabled, set_training,
 };
 
 #[cfg(test)]

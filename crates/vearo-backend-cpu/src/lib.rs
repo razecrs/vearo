@@ -41,6 +41,10 @@ pub fn init() {
             conv2d_backward,
             maxpool2d,
             maxpool2d_backward,
+            avgpool2d,
+            avgpool2d_backward,
+            batchnorm,
+            batchnorm_backward,
         },
     );
 }
@@ -1278,6 +1282,407 @@ pub fn maxpool2d_backward(
     }
 
     Tensor::from_f32(&gi, *ic.shape())
+}
+
+/// 2D average pooling (NCHW). Averages over valid (non-padded) positions only.
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+pub fn avgpool2d(input: &Tensor, kernel_size: usize, stride: usize, padding: usize) -> Tensor {
+    let ic = input.contiguous();
+    let id = ic.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let oh = (h + 2 * padding - kernel_size) / stride + 1;
+    let ow = (w + 2 * padding - kernel_size) / stride + 1;
+    let out_shape = Shape::new([n, c, oh, ow]);
+    let out = Tensor::zeros(out_shape, vearo_core::DType::F32);
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let x = read_f32(&ic);
+    let mut out_data = vec![0.0f32; out_shape.numel()];
+
+    for nn in 0..n {
+        for cc in 0..c {
+            for y in 0..oh {
+                for x_out in 0..ow {
+                    let mut sum = 0.0f32;
+                    let mut count = 0usize;
+                    for i in 0..kernel_size {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let ih = ih - padding;
+                        for j in 0..kernel_size {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            let iw = iw - padding;
+                            sum += x[((nn * c + cc) * h + ih) * w + iw];
+                            count += 1;
+                        }
+                    }
+                    out_data[((nn * c + cc) * oh + y) * ow + x_out] = sum / count as f32;
+                }
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// Backward for [`avgpool2d`]: each output gradient is split evenly across the
+/// valid input positions in its window. Returns grad input.
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+pub fn avgpool2d_backward(
+    input: &Tensor,
+    grad_out: &Tensor,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    let ic = input.contiguous();
+    let gc = grad_out.contiguous();
+    let id = ic.shape().dims();
+    let (n, c, h, w) = (id[0], id[1], id[2], id[3]);
+    let gd = gc.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let go = read_f32(&gc);
+    let mut gi = vec![0.0f32; ic.shape().numel()];
+
+    for nn in 0..n {
+        for cc in 0..c {
+            for y in 0..oh {
+                for x_out in 0..ow {
+                    let mut count = 0usize;
+                    for i in 0..kernel_size {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        for j in 0..kernel_size {
+                            let iw = x_out * stride + j;
+                            if iw >= padding && iw < w + padding {
+                                count += 1;
+                            }
+                        }
+                    }
+                    let g = go[((nn * c + cc) * oh + y) * ow + x_out] / count as f32;
+                    for i in 0..kernel_size {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let ih = ih - padding;
+                        for j in 0..kernel_size {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            let iw = iw - padding;
+                            gi[((nn * c + cc) * h + ih) * w + iw] += g;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Tensor::from_f32(&gi, *ic.shape())
+}
+
+/// 2D Batch Normalization forward on CPU (NCHW).
+#[must_use]
+#[allow(clippy::many_single_char_names, clippy::similar_names, clippy::too_many_arguments)]
+pub fn batchnorm(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    running_mean: &Tensor,
+    running_var: &Tensor,
+    training: bool,
+    momentum: f32,
+    eps: f32,
+) -> Tensor {
+    assert_eq!(x.dtype(), vearo_core::DType::F32, "Only F32 supported");
+    let xc = x.contiguous();
+    let dims = xc.shape().dims();
+    assert_eq!(dims.len(), 4, "BatchNorm2d input must be rank 4 (N, C, H, W)");
+    let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+    let m = (n * h * w) as f32;
+
+    assert_eq!(gamma.shape().rank(), 1, "Gamma must be rank 1 (C)");
+    assert_eq!(beta.shape().rank(), 1, "Beta must be rank 1 (C)");
+    assert_eq!(gamma.shape()[0], c, "Gamma dim must match channels C");
+    assert_eq!(beta.shape()[0], c, "Beta dim must match channels C");
+
+    let out = Tensor::zeros(*x.shape(), vearo_core::DType::F32);
+    if x.shape().numel() == 0 {
+        return out;
+    }
+
+    let x_data = read_f32(&xc);
+    let g_data = read_f32(gamma);
+    let b_data = read_f32(beta);
+    let mut out_data = vec![0.0f32; xc.shape().numel()];
+
+    if training {
+        let mut mean_batch = vec![0.0f32; c];
+        let mut var_batch = vec![0.0f32; c];
+
+        // 1. Compute mean for each channel
+        for cc in 0..c {
+            let mut sum = 0.0f32;
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        sum += x_data[((nn * c + cc) * h + hh) * w + ww];
+                    }
+                }
+            }
+            mean_batch[cc] = sum / m;
+        }
+
+        // 2. Compute variance for each channel
+        for cc in 0..c {
+            let mut sum_sq = 0.0f32;
+            let mean = mean_batch[cc];
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let diff = x_data[((nn * c + cc) * h + hh) * w + ww] - mean;
+                        sum_sq += diff * diff;
+                    }
+                }
+            }
+            var_batch[cc] = sum_sq / m;
+        }
+
+        // 3. Update running stats
+        let rm_data_orig = read_f32(running_mean);
+        let rv_data_orig = read_f32(running_var);
+        let mut rm_data_new = vec![0.0f32; c];
+        let mut rv_data_new = vec![0.0f32; c];
+
+        for cc in 0..c {
+            rm_data_new[cc] = (1.0 - momentum) * rm_data_orig[cc] + momentum * mean_batch[cc];
+            let bessel = if m > 1.0 { m / (m - 1.0) } else { 1.0 };
+            rv_data_new[cc] = (1.0 - momentum) * rv_data_orig[cc] + momentum * var_batch[cc] * bessel;
+        }
+        write_f32(running_mean, rm_data_new);
+        write_f32(running_var, rv_data_new);
+
+        // 4. Normalize and scale/shift
+        for cc in 0..c {
+            let mean = mean_batch[cc];
+            let var = var_batch[cc];
+            let inv_std = 1.0 / (var + eps).sqrt();
+            let gamma_val = g_data[cc];
+            let beta_val = b_data[cc];
+
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let idx = ((nn * c + cc) * h + hh) * w + ww;
+                        let x_hat = (x_data[idx] - mean) * inv_std;
+                        out_data[idx] = x_hat * gamma_val + beta_val;
+                    }
+                }
+            }
+        }
+    } else {
+        // Eval mode: use running_mean and running_var
+        let rm_data = read_f32(running_mean);
+        let rv_data = read_f32(running_var);
+
+        for cc in 0..c {
+            let mean = rm_data[cc];
+            let var = rv_data[cc];
+            let inv_std = 1.0 / (var + eps).sqrt();
+            let gamma_val = g_data[cc];
+            let beta_val = b_data[cc];
+
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let idx = ((nn * c + cc) * h + hh) * w + ww;
+                        let x_hat = (x_data[idx] - mean) * inv_std;
+                        out_data[idx] = x_hat * gamma_val + beta_val;
+                    }
+                }
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// 2D Batch Normalization backward on CPU (NCHW).
+#[must_use]
+#[allow(clippy::many_single_char_names, clippy::similar_names, clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn batchnorm_backward(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    running_mean: &Tensor,
+    running_var: &Tensor,
+    grad_out: &Tensor,
+    training: bool,
+    eps: f32,
+) -> (Tensor, Tensor, Tensor) {
+    let xc = x.contiguous();
+    let gc = grad_out.contiguous();
+    let dims = xc.shape().dims();
+    let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+    let m = (n * h * w) as f32;
+
+    let grad_x = Tensor::zeros(*x.shape(), vearo_core::DType::F32);
+    let grad_w = Tensor::zeros(*gamma.shape(), vearo_core::DType::F32);
+    let grad_b = Tensor::zeros(*beta.shape(), vearo_core::DType::F32);
+
+    if x.shape().numel() == 0 {
+        return (grad_x, grad_w, grad_b);
+    }
+
+    let x_data = read_f32(&xc);
+    let g_data = read_f32(gamma);
+    let go_data = read_f32(&gc);
+
+    let mut gx_data = vec![0.0f32; xc.shape().numel()];
+    let mut gw_data = vec![0.0f32; c];
+    let mut gb_data = vec![0.0f32; c];
+
+    if training {
+        let mut mean_batch = vec![0.0f32; c];
+        let mut var_batch = vec![0.0f32; c];
+
+        // 1. Recompute mean/var
+        for cc in 0..c {
+            let mut sum = 0.0f32;
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        sum += x_data[((nn * c + cc) * h + hh) * w + ww];
+                    }
+                }
+            }
+            mean_batch[cc] = sum / m;
+        }
+
+        for cc in 0..c {
+            let mut sum_sq = 0.0f32;
+            let mean = mean_batch[cc];
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let diff = x_data[((nn * c + cc) * h + hh) * w + ww] - mean;
+                        sum_sq += diff * diff;
+                    }
+                }
+            }
+            var_batch[cc] = sum_sq / m;
+        }
+
+        // 2. Compute grad_bias and grad_weight
+        for cc in 0..c {
+            let mean = mean_batch[cc];
+            let var = var_batch[cc];
+            let inv_std = 1.0 / (var + eps).sqrt();
+
+            let mut sum_dy = 0.0f32;
+            let mut sum_dy_xhat = 0.0f32;
+
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let idx = ((nn * c + cc) * h + hh) * w + ww;
+                        let dy = go_data[idx];
+                        let x_hat = (x_data[idx] - mean) * inv_std;
+                        sum_dy += dy;
+                        sum_dy_xhat += dy * x_hat;
+                    }
+                }
+            }
+            gb_data[cc] = sum_dy;
+            gw_data[cc] = sum_dy_xhat;
+        }
+
+        // 3. Compute grad_x
+        for cc in 0..c {
+            let mean = mean_batch[cc];
+            let var = var_batch[cc];
+            let inv_std = 1.0 / (var + eps).sqrt();
+            let gamma_val = g_data[cc];
+            let sum_dy = gb_data[cc];
+            let sum_dy_xhat = gw_data[cc];
+
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let idx = ((nn * c + cc) * h + hh) * w + ww;
+                        let dy = go_data[idx];
+                        let x_hat = (x_data[idx] - mean) * inv_std;
+                        let gx = (gamma_val * inv_std / m) * (m * dy - sum_dy - x_hat * sum_dy_xhat);
+                        gx_data[idx] = gx;
+                    }
+                }
+            }
+        }
+    } else {
+        // Eval mode backward
+        let rm_data = read_f32(running_mean);
+        let rv_data = read_f32(running_var);
+
+        // 1. Compute grad_bias and grad_weight
+        for cc in 0..c {
+            let mean = rm_data[cc];
+            let var = rv_data[cc];
+            let inv_std = 1.0 / (var + eps).sqrt();
+
+            let mut sum_dy = 0.0f32;
+            let mut sum_dy_xhat = 0.0f32;
+
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let idx = ((nn * c + cc) * h + hh) * w + ww;
+                        let dy = go_data[idx];
+                        let x_hat = (x_data[idx] - mean) * inv_std;
+                        sum_dy += dy;
+                        sum_dy_xhat += dy * x_hat;
+                    }
+                }
+            }
+            gb_data[cc] = sum_dy;
+            gw_data[cc] = sum_dy_xhat;
+        }
+
+        // 2. Compute grad_x
+        for cc in 0..c {
+            let var = rv_data[cc];
+            let inv_std = 1.0 / (var + eps).sqrt();
+            let gamma_val = g_data[cc];
+
+            for nn in 0..n {
+                for hh in 0..h {
+                    for ww in 0..w {
+                        let idx = ((nn * c + cc) * h + hh) * w + ww;
+                        let dy = go_data[idx];
+                        gx_data[idx] = dy * gamma_val * inv_std;
+                    }
+                }
+            }
+        }
+    }
+
+    write_f32(&grad_x, gx_data);
+    write_f32(&grad_w, gw_data);
+    write_f32(&grad_b, gb_data);
+    (grad_x, grad_w, grad_b)
 }
 
 #[cfg(test)]

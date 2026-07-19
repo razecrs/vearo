@@ -8,6 +8,14 @@
 //! toggling the `VEARO_USE_FUSED_ATTENTION` env var, which cannot be set without
 //! `unsafe` under edition 2024 and would leak across tests in the same process.
 
+// Test-only float formatting and index maths; lossy casts here cannot affect
+// any result under test.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops
+)]
+
 use vearo::{Device, Tensor};
 
 const B: usize = 2;
@@ -92,7 +100,7 @@ fn fused_attention_matches_unfused_reference() {
     let out_ref_t = scores.softmax(3).matmul(&v);
     let out_ref = out_ref_t.contiguous().to_vec_f32();
     reduce(&out_ref_t).backward();
-    let (dq_ref, dk_ref, dv_ref) = grads(&q, &k, &v);
+    let (ref_q, ref_k, ref_v) = grads(&q, &k, &v);
 
     // ---- fused -------------------------------------------------------------
     vearo::autograd::zero_gradients();
@@ -101,16 +109,16 @@ fn fused_attention_matches_unfused_reference() {
     let out_fused_t = q2.fused_attention(&k2, &v2, Some(&mask));
     let out_fused = out_fused_t.contiguous().to_vec_f32();
     reduce(&out_fused_t).backward();
-    let (dq_f, dk_f, dv_f) = grads(&q2, &k2, &v2);
+    let (fus_q, fus_k, fus_v) = grads(&q2, &k2, &v2);
 
     // A degenerate (all-zero) output would make every comparison below pass.
     let maxabs = out_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
     assert!(maxabs > 1e-4, "reference output is degenerate (max |out| = {maxabs})");
 
     let d_out = max_abs_diff(&out_ref, &out_fused);
-    let d_q = max_abs_diff(&dq_ref, &dq_f);
-    let d_k = max_abs_diff(&dk_ref, &dk_f);
-    let d_v = max_abs_diff(&dv_ref, &dv_f);
+    let d_q = max_abs_diff(&ref_q, &fus_q);
+    let d_k = max_abs_diff(&ref_k, &fus_k);
+    let d_v = max_abs_diff(&ref_v, &fus_v);
 
     println!("max |out| = {maxabs:.6}");
     println!("output   diff = {d_out:e}");

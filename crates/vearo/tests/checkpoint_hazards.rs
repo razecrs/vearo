@@ -12,6 +12,14 @@
 //!    block twice applies that update twice per optimizer step, so the running
 //!    statistics drift at double rate and eval-mode results are wrong.
 
+// Test-only float formatting and index maths; lossy casts here cannot affect
+// any result under test.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops
+)]
+
 use vearo::nn::Module;
 use vearo::{Device, Tensor};
 

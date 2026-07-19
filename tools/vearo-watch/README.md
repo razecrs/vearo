@@ -4,21 +4,20 @@ A live terminal dashboard for Vearo training runs. Built with
 [Ink](https://github.com/vadimdemedes/ink), which renders React to the terminal.
 
 ```
- VEARO style cnn                                          Cuda(0) ⠙ running
- ──────────────────────────────────────────────────────────────────────────
+ ╻ ╻┏━╸┏━┓┏━┓┏━┓                                                    finished
+ ┃┏┛┣╸ ┣━┫┣┳┛┃ ┃  [ Overview ]    Metrics      Memory      Config
+ ┗┛ ┗━╸╹ ╹╹┗╸┗━┛
+ ───────────────────────────────────────────────────────────────────────────
 
- ████████████████████████████░░░░░░░  79%  ep 59/75  eta 10:59
-
- ╭─ loss ───────────────────────╮╭─ val accuracy ───────────────╮
- │ ⠒⠢⣀⡀                         ││              ⣀⣀⣀⡠⠤⠒⠊⠉        │
- │     ⠈⠑⠤⢄⣀                    ││        ⢀⡠⠤⠔⠒⠉                │
- │          ⠈⠒⠢⠤⣀⡀              ││    ⣀⡠⠒⠁                      │
- ╰──────────────────────────────╯╰──────────────────────────────╯
-
- train loss        val loss          val acc         best
- 1.3527 ▼0.0145    1.4654 ▼0.0133    42.03% ▲0.0039  42.03% (ep 59)
-
- vram ▇▇▇▇▇▇▇▇▇▇▇▇ 659 MiB      ram ▇▇▇▇▇▇▇▇▇▇▇▇ 1.0 GB
+ ╭────── RUNS ──────╮ ╭─── PERFORMANCE (59) ───╮ ╭───── EVENT TRACE ──────╮
+ │├─▸style [SUCCESS]│ │3.33┤⠒⢄⡀                │ │[BEST] new best 41.64%  │
+ │└─ mlp   [RUNNING]│ │    ┤  ⠑⠢⣀⡀             │ │[BEST] new best 42.03%  │
+ │                  │ │    ┤     ⠑⠤⣀⣀          │ │[EPOCH] 59: train 1.35  │
+ ╰──────────────────╯ │1.35└        ⠈⠑⠒⠤⠤⢄⣀    │ │[DONE] best 42.03% ep59 │
+ ╭───── CURRENT ────╮ │    └───────────────────│ ╰────────────────────────╯
+ │ train  1.3527    │ │     0     37       75  │
+ │ acc    42.03%    │ │── train   ── val       │
+ ╰──────────────────╯ ╰────────────────────────╯
 ```
 
 ## Why it reads a file
@@ -64,10 +63,14 @@ node dist/cli.js runs/style_cnn.jsonl
 
 ## Controls
 
-| Key          | Action                                            |
-| ------------ | ------------------------------------------------- |
-| `q`, `esc`   | quit the dashboard (the training run is untouched)|
-| `left/right` | toggle full history and the last 30 epochs        |
+| Key            | Action                                             |
+| -------------- | -------------------------------------------------- |
+| `tab`, `right` | next view: Overview, Metrics, Memory, Config       |
+| `left`         | previous view                                      |
+| `up`/`down`    | select a run                                       |
+| `enter`        | open the selected run                              |
+| `w`            | toggle full history and the last 30 epochs         |
+| `q`, `esc`     | quit the dashboard (the training run is untouched) |
 
 ## The memory panel
 
@@ -80,12 +83,25 @@ Host RAM turns red and shows the delta once it grows more than 0.5 GB above the
 run's opening epochs. The leak this was built after only became visible when the
 process was OOM-killed at epoch 32.
 
+## Views
+
+- **Overview** - loss curves with axes, progress, resource histogram
+- **Metrics** - validation accuracy at full height
+- **Memory** - VRAM and host RAM over time, the leak check
+- **Config** - what this run actually was
+
+The RUNS panel lists every `.jsonl` beside the one you opened, so past runs stay
+browsable. Select one and press enter to load it.
+
 ## Layout
 
 - `source/stream.ts` - tails the JSONL and emits snapshots
+- `source/runs.ts` - summarises other runs in the directory
+- `source/components/Panel.tsx` - bordered panels with inline titles
+- `source/components/AxisChart.tsx` - braille charts with labelled axes
 - `source/braille.ts` - braille canvas and sparklines
-- `source/components/Chart.tsx` - overlaid line charts
-- `source/components/Panels.tsx` - header, progress, stats, memory, notes
+- `source/components/Widgets.tsx` - run list, histogram, event trace
+- `source/components/Shell.tsx` - wordmark, tab bar, status bar
 - `source/app.tsx` - layout and key handling
 
 Charts use the Unicode braille block: each character cell holds a 2x4 grid of

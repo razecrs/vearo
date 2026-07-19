@@ -1228,6 +1228,62 @@ pub fn is_training() -> bool {
     TRAINING.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// Set while activation checkpointing is rebuilding a forward block during
+    /// the backward pass. Stateful layers consult it so that a second execution
+    /// of the same block does not apply its side effects twice.
+    static RECOMPUTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Monotonic counter that seeds per-call randomness. Layers derive their
+    /// draw from it rather than holding mutable RNG state, so a recomputed block
+    /// can be made to reproduce its original draw exactly by rewinding it.
+    static RNG_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the current thread as recomputing a checkpointed block.
+///
+/// Callers must restore the previous value; see `vearo_autograd::checkpoint`.
+pub fn set_recomputing(recomputing: bool) {
+    RECOMPUTING.with(|r| r.set(recomputing));
+}
+
+/// Returns whether a checkpointed block is currently being recomputed.
+///
+/// Layers with side effects, such as `BatchNorm` updating its running
+/// statistics, must skip those effects when this is true: the block runs a
+/// second time for the same logical step, and applying them twice makes the
+/// statistics advance at double rate.
+#[must_use]
+pub fn is_recomputing() -> bool {
+    RECOMPUTING.with(std::cell::Cell::get)
+}
+
+/// Returns the current value of the per-call randomness counter.
+#[must_use]
+pub fn rng_counter() -> u64 {
+    RNG_COUNTER.with(std::cell::Cell::get)
+}
+
+/// Rewinds or advances the per-call randomness counter.
+///
+/// Checkpointing snapshots this before running a block and restores it before
+/// recomputing, so any random draw inside the block is reproduced exactly.
+/// Without that, dropout would sample a different mask on the second pass and
+/// the backward pass would differentiate a network that was never evaluated.
+pub fn set_rng_counter(value: u64) {
+    RNG_COUNTER.with(|c| c.set(value));
+}
+
+/// Returns the current counter value and advances it by one.
+#[must_use]
+pub fn next_rng_counter() -> u64 {
+    RNG_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    })
+}
+
 /// Function pointer signature for autograd tape recording hook.
 pub type RecordOpFn = fn(op_name: &str, inputs: &[&Tensor], output: &mut Tensor);
 

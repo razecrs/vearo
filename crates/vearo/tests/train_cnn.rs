@@ -38,6 +38,24 @@ fn px(s: usize) -> usize {
     3 * s * s
 }
 
+/// Resolves a preprocessed image file for side length `s`.
+///
+/// Each resolution lives in `preprocessed/img_<s>/`. Data produced before that
+/// split sits directly in `preprocessed/`, so 32px falls back there rather than
+/// forcing everyone to re-run preprocessing.
+fn image_path(s: usize, name: &str) -> String {
+    let sized = get_kaggle_path(&format!("preprocessed/img_{s}/{name}"));
+    if std::path::Path::new(&sized).exists() {
+        return sized;
+    }
+    let legacy = get_kaggle_path(&format!("preprocessed/{name}"));
+    assert!(
+        s == 32 || std::path::Path::new(&legacy).exists(),
+        "no preprocessed images for size {s}. Run: python3 scripts/preprocess.py --size {s}"
+    );
+    legacy
+}
+
 /// Feature count produced by `preprocess_tabular` in scripts/preprocess.py.
 const TAB_FEATURES: usize = 49;
 /// Tabular epochs. Best epoch is picked by validation, so a longer budget is safe.
@@ -641,11 +659,11 @@ fn test_train_cnn_full() {
 
     // ----------------- 2. Train Image Style CNN Model -----------------
     println!("=== Training Image Style CNN Model ===");
-    let x_train_img = load_bin_f32_host(&get_kaggle_path("preprocessed/image_X_train.bin"));
-    let y_train_img = load_bin_f32_host(&get_kaggle_path("preprocessed/image_y_train.bin"));
-    let x_val_img = load_bin_f32_host(&get_kaggle_path("preprocessed/image_X_val.bin"));
-    let y_val_img = load_bin_f32_host(&get_kaggle_path("preprocessed/image_y_val.bin"));
-    let x_test_img = load_bin_f32_host(&get_kaggle_path("preprocessed/image_X_test.bin"));
+    let x_train_img = load_bin_f32_host(&image_path(s, "image_X_train.bin"));
+    let y_train_img = load_bin_f32_host(&image_path(s, "image_y_train.bin"));
+    let x_val_img = load_bin_f32_host(&image_path(s, "image_X_val.bin"));
+    let y_val_img = load_bin_f32_host(&image_path(s, "image_y_val.bin"));
+    let x_test_img = load_bin_f32_host(&image_path(s, "image_X_test.bin"));
 
     // Read the test image names from sample_submission.csv once
     let sample_sub_path = get_kaggle_path("scene_style/sample_submission.csv");

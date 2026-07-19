@@ -84,24 +84,27 @@ fn measure_growth(device: Device, iters: usize) -> (i64, i64) {
     )
 }
 
+/// Both devices are checked in one test, on purpose.
+///
+/// The measurement reads the process-global CPU arena, and cargo runs `#[test]`
+/// functions on parallel threads. As two separate tests, each one's allocations
+/// land inside the other's before/after window, so a clean run can report growth
+/// that no leak caused. Keeping them sequential in a single test makes the
+/// measurement mean what it claims.
 #[test]
-fn test_no_memory_growth_cpu() {
+fn test_no_memory_growth() {
     vearo::init();
     let iters = 25;
-    let (cpu, _) = measure_growth(Device::Cpu, iters);
-    assert!(
-        cpu <= 0,
-        "CPU arena leaked {} slots over {} steps ({:.2}/step) - storage is not being reclaimed",
-        cpu,
-        iters,
-        cpu as f64 / iters as f64
-    );
-}
 
-#[test]
-fn test_no_memory_growth_cuda() {
-    vearo::init();
-    let iters = 25;
+    let (cpu_only, _) = measure_growth(Device::Cpu, iters);
+    assert!(
+        cpu_only <= 0,
+        "CPU arena leaked {} slots over {} steps ({:.2}/step) - storage is not being reclaimed",
+        cpu_only,
+        iters,
+        cpu_only as f64 / iters as f64
+    );
+
     let (cpu, cuda) = measure_growth(Device::Cuda(0), iters);
     assert!(
         cpu <= 0,

@@ -24,6 +24,9 @@ pub mod tui;
 pub use vearo_core::{DType, Device, Shape, Tensor};
 /// Training vs evaluation mode control (affects layers like dropout).
 pub use vearo_core::{is_training, set_training};
+/// Recomputation state, consulted by layers with side effects so that a
+/// checkpointed block replayed during backward does not apply them twice.
+pub use vearo_core::{is_recomputing, next_rng_counter, rng_counter, set_recomputing, set_rng_counter};
 /// Activation checkpointing.
 pub use vearo_autograd::checkpoint;
 

@@ -7,7 +7,9 @@
 //!
 //! 1. Dropout draws a fresh mask per call. If the recomputed mask differs from
 //!    the one used in the forward pass, the gradient is taken with respect to a
-//!    network that was never evaluated.
+//!    network that was never evaluated. Masks come from a thread-local counter,
+//!    so both runs below rewind it to the same point; otherwise they would draw
+//!    different masks for reasons that have nothing to do with checkpointing.
 //! 2. `BatchNorm` updates running mean/variance during training. Running the
 //!    block twice applies that update twice per optimizer step, so the running
 //!    statistics drift at double rate and eval-mode results are wrong.
@@ -26,9 +28,6 @@ use vearo::{Device, Tensor};
 /// A block containing dropout must produce the same gradient with and without
 /// checkpointing, which requires the recomputed mask to match the original.
 #[test]
-#[ignore = "KNOWN BUG: checkpoint() does not preserve RNG state across recomputation, \
-so dropout draws a different mask on the second pass and the gradient is wrong. \
-Remove this ignore once checkpoint snapshots and restores module RNG state."]
 fn dropout_inside_checkpoint_is_reproducible() {
     vearo::backend_cpu::init();
     vearo::autograd::init();
@@ -38,20 +37,22 @@ fn dropout_inside_checkpoint_is_reproducible() {
     x.set_requires_grad(true);
 
     // Same module instance both times, so any internal RNG state is shared.
-    let drop = vearo::nn::Dropout::new(0.5, 1234);
+    let drop = vearo::nn::Dropout::new(0.25, 7);
 
     // Reference: no checkpointing.
+    vearo::set_rng_counter(0);
     vearo::autograd::zero_gradients();
     vearo::autograd::reset_active_tape();
     let plain = drop.forward(&x).sum(0, false).sum(0, false);
     plain.backward();
     let grad_plain = x.grad().unwrap().to_vec_f32();
 
-    // Checkpointed, with a freshly seeded module so the first call sees the
-    // same RNG state the reference run saw.
+    // Checkpointed, rewound to the same counter so the first call inside the
+    // block draws the same mask the reference run drew.
+    vearo::set_rng_counter(0);
     vearo::autograd::zero_gradients();
     vearo::autograd::reset_active_tape();
-    let drop2 = vearo::nn::Dropout::new(0.5, 1234);
+    let drop2 = vearo::nn::Dropout::new(0.25, 7);
     let ckp = vearo::autograd::checkpoint(&x, move |inp| drop2.forward(inp))
         .sum(0, false)
         .sum(0, false);
@@ -60,6 +61,17 @@ fn dropout_inside_checkpoint_is_reproducible() {
 
     println!("plain grad:      {grad_plain:?}");
     println!("checkpoint grad: {grad_ckp:?}");
+
+    // Two all-zero gradients agree trivially. If the mask dropped every unit,
+    // this test would pass no matter how badly checkpointing behaved, so
+    // require that some units survived and carry gradient.
+    let live = grad_plain.iter().filter(|g| g.abs() > 1e-9).count();
+    assert!(
+        live > 0,
+        "every unit was dropped, so this comparison proves nothing - \
+         adjust the seed or p so some units survive"
+    );
+    println!("surviving units carrying gradient: {live}/{}", grad_plain.len());
     for (i, (a, b)) in grad_plain.iter().zip(grad_ckp.iter()).enumerate() {
         assert!(
             (a - b).abs() < 1e-6,
@@ -71,9 +83,6 @@ fn dropout_inside_checkpoint_is_reproducible() {
 
 /// Running statistics must advance once per training step, not twice.
 #[test]
-#[ignore = "KNOWN BUG: checkpoint() re-runs the block during backward, so BatchNorm \
-running statistics are updated twice per optimizer step. Remove this ignore once \
-recomputation runs with statistics updates suppressed."]
 fn batchnorm_running_stats_not_updated_twice() {
     vearo::backend_cpu::init();
     vearo::autograd::init();

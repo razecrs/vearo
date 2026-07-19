@@ -118,6 +118,10 @@ pub struct Node {
     pub inputs: Vec<Option<u32>>,
     /// Cloned tensor handles of the inputs (needed for gradient calculation).
     pub saved_tensors: Vec<Tensor>,
+    /// Value of the thread-local randomness counter when this node's forward
+    /// ran. Only checkpoint nodes use it: recomputation rewinds to this value
+    /// so any random draw inside the block reproduces its original result.
+    pub rng_counter: u64,
 }
 
 /// The autograd computation tape.
@@ -163,6 +167,7 @@ impl Tape {
                     op: OpType::Add, // leaf dummy op
                     inputs: vec![],
                     saved_tensors: vec![],
+                    rng_counter: 0,
                 });
                 input.set_node_id(Some(Self::pack(self.generation, leaf_id)));
                 input_ids.push(Some(leaf_id));
@@ -177,6 +182,8 @@ impl Tape {
             op,
             inputs: input_ids,
             saved_tensors: inputs.iter().map(|&t| t.clone()).collect(),
+            // Only checkpoint nodes consult this; ordinary ops never replay.
+            rng_counter: 0,
         });
         Self::pack(self.generation, id)
     }
@@ -664,7 +671,21 @@ pub fn backward_impl(output: &Tensor, grad: &Tensor) {
                 let old_tape = TAPE.with(|t| t.replace(local_tape));
                 let old_grads = GRADIENTS.with(|g| g.replace(HashMap::new()));
 
+                // Rewind randomness to where the original forward started, and
+                // mark the thread as recomputing so stateful layers skip their
+                // side effects. Without the rewind, dropout draws a different
+                // mask and backward differentiates a network that was never
+                // evaluated; without the flag, batchnorm advances its running
+                // statistics twice for one logical step.
+                let saved_counter = vearo_core::rng_counter();
+                vearo_core::set_rng_counter(node.rng_counter);
+                vearo_core::set_recomputing(true);
+
                 let y_new = f(x);
+
+                vearo_core::set_recomputing(false);
+                vearo_core::set_rng_counter(saved_counter);
+
                 set_autograd_enabled(false);
                 backward_impl(&y_new, &grad_out);
 
@@ -879,6 +900,10 @@ where
 {
     let was_enabled = is_autograd_enabled();
 
+    // Snapshot randomness before the block runs. Backward rewinds to exactly
+    // this point so the recomputed forward reproduces the same draws.
+    let rng_counter = vearo_core::rng_counter();
+
     // 1. Run forward pass without autograd recording
     set_autograd_enabled(false);
     let out = f(x);
@@ -905,6 +930,7 @@ where
                     op: OpType::Add, // leaf dummy
                     inputs: vec![],
                     saved_tensors: vec![],
+                    rng_counter: 0,
                 });
                 x.set_node_id(Some(Tape::pack(tape.generation, leaf_id)));
                 input_ids.push(Some(leaf_id));
@@ -918,6 +944,7 @@ where
                 op: OpType::Checkpoint,
                 inputs: input_ids,
                 saved_tensors: vec![x.clone()],
+                rng_counter,
             });
 
             CHECKPOINT_REGISTRY.with(|reg| {

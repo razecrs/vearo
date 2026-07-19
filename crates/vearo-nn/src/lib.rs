@@ -307,17 +307,17 @@ impl Module for AvgPool2d {
 /// across the CPU and CUDA backends.
 pub struct Dropout {
     p: f32,
-    rng: std::cell::RefCell<SimpleRng>,
+    /// Base seed. The mask is derived from this plus a thread-local call
+    /// counter, so the layer holds no mutable RNG state and a recomputed
+    /// forward reproduces its mask exactly.
+    seed: u64,
 }
 
 impl Dropout {
     /// Creates a new dropout layer with drop probability `p`, seeded for reproducibility.
     #[must_use]
     pub fn new(p: f32, seed: u64) -> Self {
-        Self {
-            p,
-            rng: std::cell::RefCell::new(SimpleRng::new(seed)),
-        }
+        Self { p, seed }
     }
 
     /// Device move; dropout holds no device parameters (the mask is built per forward).
@@ -325,7 +325,7 @@ impl Dropout {
     pub fn to(&self, _device: vearo_core::Device) -> Self {
         Self {
             p: self.p,
-            rng: std::cell::RefCell::new(self.rng.borrow().clone()),
+            seed: self.seed,
         }
     }
 }
@@ -337,8 +337,17 @@ impl Module for Dropout {
         }
         let scale = 1.0 / (1.0 - self.p);
         let numel = input.shape().numel();
+
+        // The mask is a pure function of (seed, call index), taken from a
+        // thread-local counter rather than from RNG state held in this module.
+        // Activation checkpointing runs a block twice and rewinds the counter
+        // before the second run, so the recomputed mask is bit-identical to the
+        // one the forward pass used. With mutable per-module state the second
+        // draw would differ and backward would differentiate a network that was
+        // never evaluated.
+        let call = vearo_core::next_rng_counter();
         let mask: Vec<f32> = {
-            let mut rng = self.rng.borrow_mut();
+            let mut rng = SimpleRng::new(self.seed ^ call.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             (0..numel)
                 .map(|_| if rng.next_f32() >= self.p { scale } else { 0.0 })
                 .collect()
@@ -412,12 +421,39 @@ impl BatchNorm2d {
     }
 }
 
+/// Copies a tensor into fresh storage.
+///
+/// `Tensor::clone` shares storage, so it cannot isolate a caller from an
+/// in-place write. This reads the values out and builds a new tensor, which is
+/// what lets checkpoint recomputation absorb the running-statistics update
+/// without touching the real buffers.
+fn detach(t: &Tensor) -> Tensor {
+    Tensor::from_f32(&t.contiguous().to_vec_f32(), *t.shape()).to(t.device())
+}
+
 impl Module for BatchNorm2d {
     fn forward(&self, input: &Tensor) -> Tensor {
         let rm = self.running_mean.borrow().clone();
         let rv = self.running_var.borrow().clone();
 
-        let out = input.batchnorm(
+        // Statistics must advance once per logical step. Activation
+        // checkpointing runs this block a second time during backward, which
+        // would otherwise move them at double rate and leave eval mode reading
+        // statistics that never corresponded to a training step.
+        //
+        // The op writes the new statistics straight into the tensors it is
+        // given, and Tensor::clone shares storage, so the update cannot be
+        // undone after the fact. Recomputation therefore passes detached copies:
+        // the update lands on those and is discarded. Training mode stays on so
+        // normalisation still uses batch statistics and the recomputed
+        // activations are bit-identical to the originals.
+        let (rm, rv) = if vearo_core::is_recomputing() {
+            (detach(&rm), detach(&rv))
+        } else {
+            (rm, rv)
+        };
+
+        input.batchnorm(
             &self.weight,
             &self.bias,
             &rm,
@@ -425,12 +461,7 @@ impl Module for BatchNorm2d {
             vearo_core::is_training(),
             self.momentum,
             self.eps,
-        );
-
-        *self.running_mean.borrow_mut() = rm;
-        *self.running_var.borrow_mut() = rv;
-
-        out
+        )
     }
 
     fn parameters(&self) -> Vec<Tensor> {

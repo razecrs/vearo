@@ -18,7 +18,6 @@ use std::io::Write;
 use vearo::nn::Module;
 use vearo::{Device, Tensor};
 
-
 /// Resolves a dataset path: `$VEARO_DATA_DIR`, then `<repo>/data/kaggle`, then legacy
 /// developer locations. Populate it with `scripts/setup_data.sh`.
 fn data_path(suffix: &str) -> String {
@@ -151,8 +150,10 @@ fn test_generate_submissions() {
             let end_idx = std::cmp::min(i + batch_size, num_samples);
             let size = end_idx - i;
 
-            let x_batch = Tensor::from_f32(&x_train_data[i * 46..end_idx * 46], vec![size, 46]).to(device);
-            let y_batch = Tensor::from_f32(&y_train_data[i * 1..end_idx * 1], vec![size, 1]).to(device);
+            let x_batch =
+                Tensor::from_f32(&x_train_data[i * 46..end_idx * 46], vec![size, 46]).to(device);
+            let y_batch =
+                Tensor::from_f32(&y_train_data[i * 1..end_idx * 1], vec![size, 1]).to(device);
 
             let pred = mlp_tab.forward(&x_batch);
             let diff = pred.sub(&y_batch);
@@ -166,7 +167,11 @@ fn test_generate_submissions() {
             opt_tab.step();
         }
         if (epoch + 1) % 10 == 0 {
-            println!("Tabular Epoch {} | Train Loss: {:.6}", epoch + 1, epoch_loss / batches as f32);
+            println!(
+                "Tabular Epoch {} | Train Loss: {:.6}",
+                epoch + 1,
+                epoch_loss / batches as f32
+            );
         }
     }
 
@@ -174,7 +179,7 @@ fn test_generate_submissions() {
     println!("Generating predictions for tabular test set...");
     vearo::autograd::zero_gradients();
     vearo::autograd::reset_active_tape();
-    
+
     let x_test = Tensor::from_f32(&x_test_data, vec![2523, 46]).to(device);
     let tab_preds = mlp_tab.forward(&x_test).to(Device::Cpu).to_vec_f32();
 
@@ -208,7 +213,9 @@ fn test_generate_submissions() {
             let end_idx = std::cmp::min(i + batch_size, num_img_samples);
             let size = end_idx - i;
 
-            let x_batch = Tensor::from_f32(&x_train_img[i * 3072..end_idx * 3072], vec![size, 3072]).to(device);
+            let x_batch =
+                Tensor::from_f32(&x_train_img[i * 3072..end_idx * 3072], vec![size, 3072])
+                    .to(device);
             let y_batch = Tensor::from_f32(&y_train_img[i * 1..end_idx * 1], vec![size]).to(device);
 
             let pred = mlp_img.forward(&x_batch);
@@ -221,7 +228,11 @@ fn test_generate_submissions() {
             opt_img.step();
         }
         if (epoch + 1) % 5 == 0 {
-            println!("Image Epoch {} | Train Loss: {:.6}", epoch + 1, epoch_loss / batches as f32);
+            println!(
+                "Image Epoch {} | Train Loss: {:.6}",
+                epoch + 1,
+                epoch_loss / batches as f32
+            );
         }
     }
 
@@ -234,7 +245,8 @@ fn test_generate_submissions() {
     let img_preds = mlp_img.forward(&x_test_t).to(Device::Cpu).to_vec_f32();
 
     // Read the test image names from sample_submission.csv
-    let sample_sub_content = std::fs::read_to_string(data_path("scene_style/sample_submission.csv")).unwrap();
+    let sample_sub_content =
+        std::fs::read_to_string(data_path("scene_style/sample_submission.csv")).unwrap();
     let image_names: Vec<String> = sample_sub_content
         .lines()
         .skip(1)

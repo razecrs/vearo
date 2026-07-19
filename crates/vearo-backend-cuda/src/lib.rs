@@ -202,6 +202,8 @@ pub fn init() {
             avgpool2d_backward,
             batchnorm,
             batchnorm_backward,
+            fused_attention,
+            fused_attention_backward,
         },
     );
 }
@@ -641,11 +643,26 @@ pub fn batchnorm(
     let p_dev = dev.htod_copy(p).unwrap();
 
     let slots = CUDA_SLOTS.lock().unwrap();
-    let x_slice = &slots[x.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let gamma_slice = &slots[gamma.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let beta_slice = &slots[beta.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let rm_slice = &slots[running_mean.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let rv_slice = &slots[running_var.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let x_slice = &slots[x.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let gamma_slice = &slots[gamma.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let beta_slice = &slots[beta.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let rm_slice = &slots[running_mean.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let rv_slice = &slots[running_var.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
     let out_slice = &slots[out_storage.slot_idx as usize].as_ref().unwrap().slice;
 
     let func = dev.get_func("vearo_kernels", "batchnorm_forward").unwrap();
@@ -727,12 +744,30 @@ pub fn batchnorm_backward(
     let p_dev = dev.htod_copy(p).unwrap();
 
     let slots = CUDA_SLOTS.lock().unwrap();
-    let x_slice = &slots[x.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let gamma_slice = &slots[gamma.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let beta_slice = &slots[beta.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let rm_slice = &slots[running_mean.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let rv_slice = &slots[running_var.storage_id().slot_idx as usize].as_ref().unwrap().slice;
-    let go_slice = &slots[grad_out.storage_id().slot_idx as usize].as_ref().unwrap().slice;
+    let x_slice = &slots[x.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let gamma_slice = &slots[gamma.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let beta_slice = &slots[beta.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let rm_slice = &slots[running_mean.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let rv_slice = &slots[running_var.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
+    let go_slice = &slots[grad_out.storage_id().slot_idx as usize]
+        .as_ref()
+        .unwrap()
+        .slice;
 
     let gi_slice = &slots[gi_storage.slot_idx as usize].as_ref().unwrap().slice;
     let gw_slice = &slots[gw_storage.slot_idx as usize].as_ref().unwrap().slice;
@@ -1523,6 +1558,50 @@ pub fn cross_entropy_backward(logits: &Tensor, targets: &Tensor, grad_out: &Tens
     grad_l
 }
 
+/// Fused attention forward on CUDA: copies to CPU, runs CPU kernel, copies back.
+pub fn fused_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Tensor {
+    let q_cpu = q.to(Device::Cpu);
+    let k_cpu = k.to(Device::Cpu);
+    let v_cpu = v.to(Device::Cpu);
+    let mask_cpu = mask.map(|m| m.to(Device::Cpu));
+
+    let cpu_ops = vearo_core::get_backend_ops(Device::Cpu)
+        .expect("CPU backend not initialized");
+    let out_cpu = (cpu_ops.fused_attention)(&q_cpu, &k_cpu, &v_cpu, mask_cpu.as_ref());
+    out_cpu.to(Device::Cuda(0))
+}
+
+/// Fused attention backward on CUDA: copies to CPU, runs CPU kernel, copies back.
+pub fn fused_attention_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    grad_out: &Tensor,
+) -> (Tensor, Tensor, Tensor) {
+    let q_cpu = q.to(Device::Cpu);
+    let k_cpu = k.to(Device::Cpu);
+    let v_cpu = v.to(Device::Cpu);
+    let mask_cpu = mask.map(|m| m.to(Device::Cpu));
+    let go_cpu = grad_out.to(Device::Cpu);
+
+    let cpu_ops = vearo_core::get_backend_ops(Device::Cpu)
+        .expect("CPU backend not initialized");
+    let (dq_cpu, dk_cpu, dv_cpu) = (cpu_ops.fused_attention_backward)(
+        &q_cpu,
+        &k_cpu,
+        &v_cpu,
+        mask_cpu.as_ref(),
+        &go_cpu,
+    );
+
+    (
+        dq_cpu.to(Device::Cuda(0)),
+        dk_cpu.to(Device::Cuda(0)),
+        dv_cpu.to(Device::Cuda(0)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1633,7 +1712,9 @@ mod tests {
 
         // unary: transposed input
         let x = Tensor::from_f32(
-            &[-2.0, -1.0, 0.5, 1.0, 2.0, 3.0, -0.5, 4.0, -3.0, 0.0, 1.5, -1.5],
+            &[
+                -2.0, -1.0, 0.5, 1.0, 2.0, 3.0, -0.5, 4.0, -3.0, 0.0, 1.5, -1.5,
+            ],
             [3, 4],
         )
         .to(cuda);
@@ -1642,17 +1723,40 @@ mod tests {
         check("gelu(nc)", &xt.gelu(), &xt.contiguous().gelu());
 
         // reductions over each axis
-        check("sum(nc,d0)", &xt.sum(0, false), &xt.contiguous().sum(0, false));
-        check("sum(nc,d1)", &xt.sum(1, true), &xt.contiguous().sum(1, true));
-        check("mean(nc,d0)", &xt.mean(0, false), &xt.contiguous().mean(0, false));
+        check(
+            "sum(nc,d0)",
+            &xt.sum(0, false),
+            &xt.contiguous().sum(0, false),
+        );
+        check(
+            "sum(nc,d1)",
+            &xt.sum(1, true),
+            &xt.contiguous().sum(1, true),
+        );
+        check(
+            "mean(nc,d0)",
+            &xt.mean(0, false),
+            &xt.contiguous().mean(0, false),
+        );
 
         // softmax over each axis
-        check("softmax(nc,d0)", &xt.softmax(0), &xt.contiguous().softmax(0));
-        check("softmax(nc,d1)", &xt.softmax(1), &xt.contiguous().softmax(1));
+        check(
+            "softmax(nc,d0)",
+            &xt.softmax(0),
+            &xt.contiguous().softmax(0),
+        );
+        check(
+            "softmax(nc,d1)",
+            &xt.softmax(1),
+            &xt.contiguous().softmax(1),
+        );
 
         // layernorm: permuted so it stays non-contiguous but the normalized last dim is intact
-        let ln =
-            Tensor::from_f32(&(0..24).map(|i| i as f32 * 0.1).collect::<Vec<_>>(), [2, 3, 4]).to(cuda);
+        let ln = Tensor::from_f32(
+            &(0..24).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            [2, 3, 4],
+        )
+        .to(cuda);
         let lnp = ln.permute([1, 0, 2]); // [3,2,4] non-contiguous, last dim = 4
         let w = Tensor::from_f32(&[1.0, 0.5, 2.0, 1.5], [4]).to(cuda);
         let bb = Tensor::from_f32(&[0.1, -0.1, 0.2, 0.0], [4]).to(cuda);
@@ -1753,7 +1857,10 @@ mod tests {
             (0..numel).map(|i| (i as f32 * seed + seed).sin()).collect()
         };
         let maxdiff = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
 
         for &(k, stride, padding) in &[(2usize, 2usize, 0usize), (3usize, 2usize, 1usize)] {
@@ -1767,15 +1874,24 @@ mod tests {
             let gog = go.to(cuda);
 
             let fwd_c = x.maxpool2d(k, stride, padding).to_vec_f32();
-            let fwd_g = xg.maxpool2d(k, stride, padding).to(Device::Cpu).to_vec_f32();
-            assert!(maxdiff(&fwd_c, &fwd_g) < 1e-4, "maxpool fwd k{k}s{stride}p{padding}");
+            let fwd_g = xg
+                .maxpool2d(k, stride, padding)
+                .to(Device::Cpu)
+                .to_vec_f32();
+            assert!(
+                maxdiff(&fwd_c, &fwd_g) < 1e-4,
+                "maxpool fwd k{k}s{stride}p{padding}"
+            );
 
             let gi_c = x.maxpool2d_backward(&go, k, stride, padding).to_vec_f32();
             let gi_g = xg
                 .maxpool2d_backward(&gog, k, stride, padding)
                 .to(Device::Cpu)
                 .to_vec_f32();
-            assert!(maxdiff(&gi_c, &gi_g) < 1e-4, "maxpool bwd k{k}s{stride}p{padding}");
+            assert!(
+                maxdiff(&gi_c, &gi_g) < 1e-4,
+                "maxpool bwd k{k}s{stride}p{padding}"
+            );
         }
     }
 
@@ -1791,7 +1907,10 @@ mod tests {
             (0..numel).map(|i| (i as f32 * seed + seed).sin()).collect()
         };
         let maxdiff = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
 
         for &(k, stride, padding) in &[(2usize, 2usize, 0usize), (3usize, 2usize, 1usize)] {
@@ -1805,15 +1924,24 @@ mod tests {
             let gog = go.to(cuda);
 
             let fwd_c = x.avgpool2d(k, stride, padding).to_vec_f32();
-            let fwd_g = xg.avgpool2d(k, stride, padding).to(Device::Cpu).to_vec_f32();
-            assert!(maxdiff(&fwd_c, &fwd_g) < 1e-4, "avgpool fwd k{k}s{stride}p{padding}");
+            let fwd_g = xg
+                .avgpool2d(k, stride, padding)
+                .to(Device::Cpu)
+                .to_vec_f32();
+            assert!(
+                maxdiff(&fwd_c, &fwd_g) < 1e-4,
+                "avgpool fwd k{k}s{stride}p{padding}"
+            );
 
             let gi_c = x.avgpool2d_backward(&go, k, stride, padding).to_vec_f32();
             let gi_g = xg
                 .avgpool2d_backward(&gog, k, stride, padding)
                 .to(Device::Cpu)
                 .to_vec_f32();
-            assert!(maxdiff(&gi_c, &gi_g) < 1e-4, "avgpool bwd k{k}s{stride}p{padding}");
+            assert!(
+                maxdiff(&gi_c, &gi_g) < 1e-4,
+                "avgpool bwd k{k}s{stride}p{padding}"
+            );
         }
     }
 }

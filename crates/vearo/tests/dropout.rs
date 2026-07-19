@@ -6,8 +6,8 @@
     clippy::many_single_char_names
 )]
 
-use vearo::nn::{Dropout, Module};
 use vearo::Tensor;
+use vearo::nn::{Dropout, Module};
 
 fn setup() {
     vearo::backend_cpu::init();
@@ -69,7 +69,11 @@ fn test_dropout_grad_through_mask() {
         if y_vec[i] == 0.0 {
             assert_eq!(g[i], 0.0, "dropped elem {i} must have zero grad");
         } else {
-            assert!((g[i] - scale).abs() < 1e-5, "kept elem {i} grad {} != {scale}", g[i]);
+            assert!(
+                (g[i] - scale).abs() < 1e-5,
+                "kept elem {i} grad {} != {scale}",
+                g[i]
+            );
         }
     }
 }

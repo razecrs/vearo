@@ -32,10 +32,59 @@ def preprocess_tabular(data_dir, out_dir):
     train_df = pd.read_csv(os.path.join(data_dir, "item_price/train.csv"))
     test_df = pd.read_csv(os.path.join(data_dir, "item_price/test.csv"))
 
-    train_df["X2"] = train_df["X2"].fillna(train_df["X2"].mean())
+    # Track missingness explicitly before filling nulls
+    train_df["X2_missing"] = train_df["X2"].isnull().astype(float)
+    test_df["X2_missing"] = test_df["X2"].isnull().astype(float)
+    train_df["X9_missing"] = train_df["X9"].isnull().astype(float)
+    test_df["X9_missing"] = test_df["X9"].isnull().astype(float)
+
+    # 1. Fill missing weights X2 based on product ID X1 group mean across both datasets
+    combined_temp = pd.concat([train_df.drop(columns=["Y"], errors="ignore"), test_df], axis=0)
+    weight_map = combined_temp.groupby("X1")["X2"].mean()
+    
+    train_df["X2"] = train_df["X2"].fillna(train_df["X1"].map(weight_map))
+    test_df["X2"] = test_df["X2"].fillna(test_df["X1"].map(weight_map))
+    
+    # Fill remaining missing weights with global train mean
+    global_mean_weight = train_df["X2"].mean()
+    train_df["X2"] = train_df["X2"].fillna(global_mean_weight)
+    test_df["X2"] = test_df["X2"].fillna(global_mean_weight)
+
+    # 2. Impute missing outlet sizes X9 logically based on outlet type X11 and location X10
+    def impute_outlet_size(row):
+        if pd.isna(row["X9"]):
+            if row["X11"] == "Grocery Store":
+                return "Small"
+            elif row["X11"] in ["Supermarket Type2", "Supermarket Type3"]:
+                return "Medium"
+            elif row["X11"] == "Supermarket Type1" and row["X10"] == "Tier 2":
+                return "Small"
+        return row["X9"]
+
+    train_df["X9"] = train_df.apply(impute_outlet_size, axis=1)
+    test_df["X9"] = test_df.apply(impute_outlet_size, axis=1)
     train_df["X9"] = train_df["X9"].fillna("Missing")
-    test_df["X2"] = test_df["X2"].fillna(train_df["X2"].mean())
     test_df["X9"] = test_df["X9"].fillna("Missing")
+
+    # 3. Map inconsistent categories in X3 (Fat Content)
+    x3_map = {
+        "LF": "Low Fat",
+        "low fat": "Low Fat",
+        "reg": "Regular",
+        "Low Fat": "Low Fat",
+        "Regular": "Regular"
+    }
+    train_df["X3"] = train_df["X3"].map(x3_map)
+    test_df["X3"] = test_df["X3"].map(x3_map)
+
+    # 4. NC (Non-Consumable) items should not have food fat content labels
+    train_df.loc[train_df["X1"].str.startswith("NC"), "X3"] = "Non-Edible"
+    test_df.loc[test_df["X1"].str.startswith("NC"), "X3"] = "Non-Edible"
+
+    # 5. Replace 0.0 values in X4 (Product Visibility) with mean visibility of that product type (X5)
+    mean_vis = train_df[train_df["X4"] > 0].groupby("X5")["X4"].mean()
+    for df in [train_df, test_df]:
+        df.loc[df["X4"] == 0.0, "X4"] = df.loc[df["X4"] == 0.0, "X5"].map(mean_vis)
 
     y = train_df["Y"].values.astype(np.float32)
     x_train_raw = train_df.drop(columns=["Y"])
@@ -43,7 +92,19 @@ def preprocess_tabular(data_dir, out_dir):
     test_ids = test_df["X1"].values
 
     combined = pd.concat([x_train_raw, x_test_raw], axis=0, ignore_index=True)
-    categorical = ["X3", "X5", "X7", "X9", "X10", "X11"]
+
+    # 6. Extract Category Prefix from X1
+    combined["X1_prefix"] = combined["X1"].str[:2]
+
+    # 7. Convert establishment year X8 to Outlet Age (relative to data collections in 2013)
+    combined["Outlet_Age"] = 2013 - combined["X8"]
+    combined = combined.drop(columns=["X8"])
+
+    # 8. Add Visibility to Mean Ratio (relative to average visibility in that outlet X7)
+    outlet_mean_vis = combined.groupby("X7")["X4"].transform("mean")
+    combined["Visibility_Mean_Ratio"] = combined["X4"] / (outlet_mean_vis + 1e-8)
+
+    categorical = ["X3", "X5", "X7", "X9", "X10", "X11", "X1_prefix"]
     encoded = pd.get_dummies(combined, columns=categorical, drop_first=False)
     encoded = encoded.drop(columns=["X1"])
 

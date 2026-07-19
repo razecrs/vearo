@@ -98,7 +98,11 @@ fn run_cnn(device: Device) -> f32 {
 fn test_cnn_overfits_mnist_cpu() {
     vearo::init();
     let acc = run_cnn(Device::Cpu);
-    assert!(acc > 0.9, "CPU CNN failed to overfit MNIST digits; train acc {}", acc);
+    assert!(
+        acc > 0.9,
+        "CPU CNN failed to overfit MNIST digits; train acc {}",
+        acc
+    );
 }
 
 #[test]
@@ -106,7 +110,11 @@ fn test_cnn_overfits_mnist_cpu() {
 fn test_cnn_overfits_mnist_cuda() {
     vearo::init();
     let acc = run_cnn(Device::Cuda(0));
-    assert!(acc > 0.9, "CUDA CNN failed to overfit MNIST digits; train acc {}", acc);
+    assert!(
+        acc > 0.9,
+        "CUDA CNN failed to overfit MNIST digits; train acc {}",
+        acc
+    );
 }
 
 /// Trains a CNN *with max pooling* to overfit `n` MNIST digits on `device`; returns final accuracy.
@@ -179,7 +187,11 @@ fn run_cnn_pool(device: Device) -> f32 {
 fn test_cnn_maxpool_overfits_cpu() {
     vearo::init();
     let acc = run_cnn_pool(Device::Cpu);
-    assert!(acc > 0.9, "CPU maxpool-CNN failed to overfit; train acc {}", acc);
+    assert!(
+        acc > 0.9,
+        "CPU maxpool-CNN failed to overfit; train acc {}",
+        acc
+    );
 }
 
 #[test]
@@ -187,5 +199,9 @@ fn test_cnn_maxpool_overfits_cpu() {
 fn test_cnn_maxpool_overfits_cuda() {
     vearo::init();
     let acc = run_cnn_pool(Device::Cuda(0));
-    assert!(acc > 0.9, "CUDA maxpool-CNN failed to overfit; train acc {}", acc);
+    assert!(
+        acc > 0.9,
+        "CUDA maxpool-CNN failed to overfit; train acc {}",
+        acc
+    );
 }

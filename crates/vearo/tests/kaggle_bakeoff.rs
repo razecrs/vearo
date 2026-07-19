@@ -12,7 +12,6 @@ use std::time::Instant;
 use vearo::nn::Module;
 use vearo::{Device, Tensor};
 
-
 /// Resolves a dataset path: `$VEARO_DATA_DIR`, then `<repo>/data/kaggle`, then legacy
 /// developer locations. Populate it with `scripts/setup_data.sh`.
 fn data_path(suffix: &str) -> String {
@@ -120,16 +119,10 @@ impl ImageMlp {
 fn run_tabular(device: Device) -> f64 {
     println!("\n--- Vearo Tabular Regression on {:?} ---", device);
 
-    let x_train_data = load_bin_f32_host(
-        &data_path("preprocessed/tabular_X_train.bin"),
-    );
-    let y_train_data = load_bin_f32_host(
-        &data_path("preprocessed/tabular_y_train.bin"),
-    );
-    let x_val_data =
-        load_bin_f32_host(&data_path("preprocessed/tabular_X_val.bin"));
-    let y_val_data =
-        load_bin_f32_host(&data_path("preprocessed/tabular_y_val.bin"));
+    let x_train_data = load_bin_f32_host(&data_path("preprocessed/tabular_X_train.bin"));
+    let y_train_data = load_bin_f32_host(&data_path("preprocessed/tabular_y_train.bin"));
+    let x_val_data = load_bin_f32_host(&data_path("preprocessed/tabular_X_val.bin"));
+    let y_val_data = load_bin_f32_host(&data_path("preprocessed/tabular_y_val.bin"));
 
     let x_val = Tensor::from_f32(&x_val_data, vec![1200, 46]).to(device);
     let y_val = Tensor::from_f32(&y_val_data, vec![1200, 1]).to(device);
@@ -197,14 +190,10 @@ fn run_tabular(device: Device) -> f64 {
 fn run_image(device: Device) -> f64 {
     println!("\n--- Vearo Image Classification on {:?} ---", device);
 
-    let x_train_data =
-        load_bin_f32_host(&data_path("preprocessed/image_X_train.bin"));
-    let y_train_data =
-        load_bin_f32_host(&data_path("preprocessed/image_y_train.bin"));
-    let x_val_data =
-        load_bin_f32_host(&data_path("preprocessed/image_X_val.bin"));
-    let y_val_data =
-        load_bin_f32_host(&data_path("preprocessed/image_y_val.bin"));
+    let x_train_data = load_bin_f32_host(&data_path("preprocessed/image_X_train.bin"));
+    let y_train_data = load_bin_f32_host(&data_path("preprocessed/image_y_train.bin"));
+    let x_val_data = load_bin_f32_host(&data_path("preprocessed/image_X_val.bin"));
+    let y_val_data = load_bin_f32_host(&data_path("preprocessed/image_y_val.bin"));
 
     // Sizes are derived from the data, not hardcoded: re-exporting the dataset
     // (e.g. the CHW fix) changes the split sizes and would otherwise break this test.

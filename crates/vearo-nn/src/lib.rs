@@ -568,21 +568,19 @@ impl MultiHeadAttention {
         let k = k.reshape([b, s, h, d_k]).transpose(1, 2);
         let v = v.reshape([b, s, h, d_k]).transpose(1, 2);
 
-        // 3. Compute attention scores: Q K^T / sqrt(d_k)
-        let k_t = k.transpose(2, 3); // [B, H, D_k, S]
-        let scale = Tensor::from_f32(&[1.0 / (d_k as f32).sqrt()], [1]);
-        let mut scores = q.matmul(&k_t).mul(&scale); // [B, H, S, S]
-
-        // 4. Apply mask if present (adds mask elementwise)
-        if let Some(m) = mask {
-            scores = scores.add(m);
-        }
-
-        // 5. Softmax attention probabilities
-        let probs = scores.softmax(3);
-
-        // 6. Compute output: probs * V -> [B, H, S, D_k]
-        let out = probs.matmul(&v);
+        // 3. Compute attention scores and output (fused or standard path)
+        let out = if std::env::var("VEARO_USE_FUSED_ATTENTION").map_or(true, |val| val != "0" && val != "false") {
+            q.fused_attention(&k, &v, mask)
+        } else {
+            let k_t = k.transpose(2, 3);
+            let scale = Tensor::from_f32(&[1.0 / (d_k as f32).sqrt()], [1]);
+            let mut scores = q.matmul(&k_t).mul(&scale);
+            if let Some(m) = mask {
+                scores = scores.add(m);
+            }
+            let probs = scores.softmax(3);
+            probs.matmul(&v)
+        };
 
         // 7. Transpose back: [B, H, S, D_k] -> [B, S, H, D_k] -> reshape [B, S, D]
         let out = out.transpose(1, 2).reshape([b, s, d]);
@@ -778,6 +776,202 @@ impl SimpleGPT {
     }
 }
 
+/// Complex-valued tensor math and layers.
+pub mod complex {
+    use super::{SimpleRng, Tensor};
+    use vearo_core::{DType, Device, Shape};
+
+    /// A complex-valued tensor represented as separate real and imaginary tensors.
+    #[derive(Clone, Debug)]
+    pub struct ComplexTensor {
+        /// The real part of the complex tensor.
+        pub real: Tensor,
+        /// The imaginary part of the complex tensor.
+        pub imag: Tensor,
+    }
+
+    impl ComplexTensor {
+        /// Creates a new complex tensor from real and imaginary parts.
+        ///
+        /// # Panics
+        /// Panics if shapes or devices do not match.
+        #[must_use]
+        pub fn new(real: Tensor, imag: Tensor) -> Self {
+            assert_eq!(real.shape(), imag.shape(), "Real and imaginary shapes must match");
+            assert_eq!(real.device(), imag.device(), "Real and imaginary devices must match");
+            Self { real, imag }
+        }
+
+        /// Creates a complex tensor of zeros.
+        #[must_use]
+        pub fn zeros(shape: impl Into<Shape>, device: Device) -> Self {
+            let shape = shape.into();
+            Self {
+                real: Tensor::zeros(shape, DType::F32).to(device),
+                imag: Tensor::zeros(shape, DType::F32).to(device),
+            }
+        }
+
+        /// Performs elementwise complex addition.
+        #[must_use]
+        pub fn add(&self, other: &Self) -> Self {
+            Self::new(self.real.add(&other.real), self.imag.add(&other.imag))
+        }
+
+        /// Performs elementwise complex subtraction.
+        #[must_use]
+        pub fn sub(&self, other: &Self) -> Self {
+            Self::new(self.real.sub(&other.real), self.imag.sub(&other.imag))
+        }
+
+        /// Performs complex matrix multiplication: `self * other`.
+        ///
+        /// (A_real + i A_imag) * (B_real + i B_imag) = (A_real * B_real - A_imag * B_imag) + i (A_real * B_imag + A_imag * B_real)
+        #[must_use]
+        pub fn matmul(&self, other: &Self) -> Self {
+            let real_part = self.real.matmul(&other.real).sub(&self.imag.matmul(&other.imag));
+            let imag_part = self.real.matmul(&other.imag).add(&self.imag.matmul(&other.real));
+            Self::new(real_part, imag_part)
+        }
+
+        /// Applies complex ReLU: `ReLU(real) + i ReLU(imag)`.
+        #[must_use]
+        pub fn relu(&self) -> Self {
+            Self::new(self.real.relu(), self.imag.relu())
+        }
+
+        /// Applies complex GELU: `GELU(real) + i GELU(imag)`.
+        #[must_use]
+        pub fn gelu(&self) -> Self {
+            Self::new(self.real.gelu(), self.imag.gelu())
+        }
+
+        /// Moves the complex tensor to a different device.
+        #[must_use]
+        pub fn to(&self, device: Device) -> Self {
+            Self::new(self.real.to(device), self.imag.to(device))
+        }
+
+        /// Set requires_grad on the constituent real and imaginary tensors.
+        pub fn set_requires_grad(&self, requires_grad: bool) {
+            self.real.set_requires_grad(requires_grad);
+            self.imag.set_requires_grad(requires_grad);
+        }
+    }
+
+    /// A complex-valued linear layer: `y = x W^T + b`.
+    pub struct ComplexLinear {
+        /// The real part of the weight tensor.
+        pub w_real: Tensor,
+        /// The imaginary part of the weight tensor.
+        pub w_imag: Tensor,
+        /// The real part of the bias tensor.
+        pub b_real: Option<Tensor>,
+        /// The imaginary part of the bias tensor.
+        pub b_imag: Option<Tensor>,
+    }
+
+    impl ComplexLinear {
+        /// Creates a new ComplexLinear layer.
+        ///
+        /// Initialization bounds follow `Linear` using uniform distribution.
+        ///
+        /// # Panics
+        /// Panics if in_features is 0.
+        #[must_use]
+        #[allow(clippy::similar_names)]
+        pub fn new(in_features: usize, out_features: usize, bias: bool, seed: u64) -> Self {
+            assert!(in_features > 0, "in_features must be greater than 0");
+            let mut rng = SimpleRng::new(seed);
+            let bound = 1.0 / (in_features as f32).sqrt();
+
+            let numel_w = out_features * in_features;
+            let mut wr_data = vec![0.0; numel_w];
+            let mut wi_data = vec![0.0; numel_w];
+            for i in 0..numel_w {
+                wr_data[i] = rng.next_uniform(-bound, bound);
+                wi_data[i] = rng.next_uniform(-bound, bound);
+            }
+
+            let w_real = Tensor::from_f32(&wr_data, [out_features, in_features]);
+            let w_imag = Tensor::from_f32(&wi_data, [out_features, in_features]);
+            w_real.set_requires_grad(true);
+            w_imag.set_requires_grad(true);
+
+            let (b_real, b_imag) = if bias {
+                let mut br_data = vec![0.0; out_features];
+                let mut bi_data = vec![0.0; out_features];
+                for i in 0..out_features {
+                    br_data[i] = rng.next_uniform(-bound, bound);
+                    bi_data[i] = rng.next_uniform(-bound, bound);
+                }
+                let br = Tensor::from_f32(&br_data, [out_features]);
+                let bi = Tensor::from_f32(&bi_data, [out_features]);
+                br.set_requires_grad(true);
+                bi.set_requires_grad(true);
+                (Some(br), Some(bi))
+            } else {
+                (None, None)
+            };
+
+            Self {
+                w_real,
+                w_imag,
+                b_real,
+                b_imag,
+            }
+        }
+
+        /// Performs the forward pass.
+        ///
+        /// For weights W = W_r + i W_i and inputs X = X_r + i X_i:
+        ///
+        /// Y = X W^T + b = (X_r W_r^T - X_i W_i^T) + i (X_r W_i^T + X_i W_r^T) + b
+        #[must_use]
+        #[allow(clippy::similar_names)]
+        pub fn forward(&self, x: &ComplexTensor) -> ComplexTensor {
+            let wr_t = self.w_real.transpose(0, 1);
+            let wi_t = self.w_imag.transpose(0, 1);
+
+            let mut y_real = x.real.matmul(&wr_t).sub(&x.imag.matmul(&wi_t));
+            let mut y_imag = x.real.matmul(&wi_t).add(&x.imag.matmul(&wr_t));
+
+            if let Some(ref br) = self.b_real {
+                y_real = y_real.add(br);
+            }
+            if let Some(ref bi) = self.b_imag {
+                y_imag = y_imag.add(bi);
+            }
+
+            ComplexTensor::new(y_real, y_imag)
+        }
+
+        /// Moves the layer parameters to a different device.
+        #[must_use]
+        pub fn to(&self, device: Device) -> Self {
+            Self {
+                w_real: self.w_real.to(device),
+                w_imag: self.w_imag.to(device),
+                b_real: self.b_real.as_ref().map(|b| b.to(device)),
+                b_imag: self.b_imag.as_ref().map(|b| b.to(device)),
+            }
+        }
+
+        /// Returns the parameters of the layer.
+        #[must_use]
+        pub fn parameters(&self) -> Vec<Tensor> {
+            let mut params = vec![self.w_real.clone(), self.w_imag.clone()];
+            if let Some(ref br) = self.b_real {
+                params.push(br.clone());
+            }
+            if let Some(ref bi) = self.b_imag {
+                params.push(bi.clone());
+            }
+            params
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,5 +987,28 @@ mod tests {
         let input = Tensor::from_f32(&[1.0, 2.0, 3.0], [1, 3]);
         let output = layer.forward(&input);
         assert_eq!(output.shape().dims(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_complex_linear() {
+        vearo_backend_cpu::init();
+        vearo_autograd::init();
+
+        let layer = complex::ComplexLinear::new(3, 2, true, 42);
+        assert_eq!(layer.w_real.shape().dims(), &[2, 3]);
+        assert_eq!(layer.w_imag.shape().dims(), &[2, 3]);
+
+        let x_real = Tensor::from_f32(&[1.0, 2.0, 3.0], [1, 3]);
+        let x_imag = Tensor::from_f32(&[-1.0, 0.0, 1.0], [1, 3]);
+        let x = complex::ComplexTensor::new(x_real, x_imag);
+
+        let y = layer.forward(&x);
+        assert_eq!(y.real.shape().dims(), &[1, 2]);
+        assert_eq!(y.imag.shape().dims(), &[1, 2]);
+
+        // Verify backpropagation
+        y.real.sum(0, false).sum(0, false).backward();
+        assert!(layer.w_real.grad().is_some());
+        assert!(layer.w_imag.grad().is_some());
     }
 }

@@ -18,7 +18,10 @@ fn setup() {
 }
 
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 #[test]
@@ -33,7 +36,7 @@ fn test_batchnorm_forward_train_eval_parity() {
 
     // 1. Setup inputs (random sine wave to be deterministic)
     let x_data: Vec<f32> = (0..numel).map(|i| (i as f32 * 0.1).sin()).collect();
-    
+
     // Test training mode
     {
         vearo::set_training(true);
@@ -59,7 +62,10 @@ fn test_batchnorm_forward_train_eval_parity() {
 
         let rv_cpu = bn_cpu.running_var.borrow().to_vec_f32();
         let rv_cuda = bn_cuda.running_var.borrow().to(Device::Cpu).to_vec_f32();
-        assert!(max_diff(&rv_cpu, &rv_cuda) < 1e-5, "Running variance mismatch");
+        assert!(
+            max_diff(&rv_cpu, &rv_cuda) < 1e-5,
+            "Running variance mismatch"
+        );
     }
 
     // Test eval mode
@@ -110,7 +116,11 @@ fn test_batchnorm_backward_parity() {
         x_cpu.set_requires_grad(true);
 
         let y_cpu = bn_cpu.forward(&x_cpu);
-        let loss_cpu = y_cpu.sum(0, false).sum(0, false).sum(0, false).sum(0, false);
+        let loss_cpu = y_cpu
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false);
         loss_cpu.backward();
 
         let gx_cpu = x_cpu.grad().unwrap().to_vec_f32();
@@ -126,7 +136,11 @@ fn test_batchnorm_backward_parity() {
         x_cuda.set_requires_grad(true);
 
         let y_cuda = bn_cuda.forward(&x_cuda);
-        let loss_cuda = y_cuda.sum(0, false).sum(0, false).sum(0, false).sum(0, false);
+        let loss_cuda = y_cuda
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false);
         loss_cuda.backward();
 
         let gx_cuda = x_cuda.grad().unwrap().to(Device::Cpu).to_vec_f32();
@@ -149,7 +163,11 @@ fn test_batchnorm_backward_parity() {
         x_cpu.set_requires_grad(true);
 
         let y_cpu = bn_cpu.forward(&x_cpu);
-        let loss_cpu = y_cpu.sum(0, false).sum(0, false).sum(0, false).sum(0, false);
+        let loss_cpu = y_cpu
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false);
         loss_cpu.backward();
 
         let gx_cpu = x_cpu.grad().unwrap().to_vec_f32();
@@ -165,7 +183,11 @@ fn test_batchnorm_backward_parity() {
         x_cuda.set_requires_grad(true);
 
         let y_cuda = bn_cuda.forward(&x_cuda);
-        let loss_cuda = y_cuda.sum(0, false).sum(0, false).sum(0, false).sum(0, false);
+        let loss_cuda = y_cuda
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false)
+            .sum(0, false);
         loss_cuda.backward();
 
         let gx_cuda = x_cuda.grad().unwrap().to(Device::Cpu).to_vec_f32();
@@ -173,7 +195,13 @@ fn test_batchnorm_backward_parity() {
         let gb_cuda = bn_cuda.bias.grad().unwrap().to(Device::Cpu).to_vec_f32();
 
         assert!(max_diff(&gx_cpu, &gx_cuda) < 1e-5, "Eval grad_x mismatch");
-        assert!(max_diff(&gw_cpu, &gw_cuda) < 1e-5, "Eval grad_weight mismatch");
-        assert!(max_diff(&gb_cpu, &gb_cuda) < 1e-5, "Eval grad_bias mismatch");
+        assert!(
+            max_diff(&gw_cpu, &gw_cuda) < 1e-5,
+            "Eval grad_weight mismatch"
+        );
+        assert!(
+            max_diff(&gb_cpu, &gb_cuda) < 1e-5,
+            "Eval grad_bias mismatch"
+        );
     }
 }

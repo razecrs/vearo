@@ -134,6 +134,174 @@ impl AdamW {
     }
 }
 
+/// Quantized state block-wise representation.
+pub struct QuantizedState {
+    data: Vec<i8>,
+    scales: Vec<f32>,
+    block_size: usize,
+}
+
+impl QuantizedState {
+    /// Creates a new `QuantizedState` initialized with zeros.
+    #[must_use]
+    pub fn new(numel: usize, block_size: usize) -> Self {
+        let num_blocks = numel.div_ceil(block_size);
+        Self {
+            data: vec![0; numel],
+            scales: vec![0.0; num_blocks],
+            block_size,
+        }
+    }
+
+    /// Quantizes the source float slice into 8-bit block-wise representation in-place.
+    #[allow(clippy::needless_range_loop, clippy::cast_possible_truncation)]
+    pub fn quantize(&mut self, src: &[f32]) {
+        let numel = src.len();
+        let block_size = self.block_size;
+
+        for (b_idx, scale) in self.scales.iter_mut().enumerate() {
+            let start = b_idx * block_size;
+            let end = std::cmp::min(start + block_size, numel);
+            if start >= end {
+                continue;
+            }
+
+            let block = &src[start..end];
+            let mut max_val = 0.0f32;
+            for &val in block {
+                let abs_val = val.abs();
+                if abs_val > max_val {
+                    max_val = abs_val;
+                }
+            }
+
+            *scale = max_val / 127.0;
+
+            if max_val > 0.0 {
+                let inv_scale = 127.0 / max_val;
+                for i in start..end {
+                    let val = src[i];
+                    let q_val = (val * inv_scale).round();
+                    self.data[i] = q_val.clamp(-127.0, 127.0) as i8;
+                }
+            } else {
+                for i in start..end {
+                    self.data[i] = 0;
+                }
+            }
+        }
+    }
+
+    /// Dequantizes the 8-bit block-wise representation back to floats in-place.
+    #[allow(clippy::needless_range_loop)]
+    pub fn dequantize(&self, dst: &mut [f32]) {
+        let numel = dst.len();
+        let block_size = self.block_size;
+
+        for (b_idx, &scale) in self.scales.iter().enumerate() {
+            let start = b_idx * block_size;
+            let end = std::cmp::min(start + block_size, numel);
+
+            for i in start..end {
+                dst[i] = f32::from(self.data[i]) * scale;
+            }
+        }
+    }
+}
+
+/// 8-bit AdamW optimizer with block-wise quantized optimizer states (m and v).
+/// Saves 75% memory on optimizer states.
+pub struct AdamW8bit {
+    params: Vec<Tensor>,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    m: Vec<QuantizedState>,
+    v: Vec<QuantizedState>,
+    t: u32,
+}
+
+impl AdamW8bit {
+    /// Creates a new 8-bit AdamW optimizer.
+    #[must_use]
+    pub fn new(
+        params: Vec<Tensor>,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+    ) -> Self {
+        let mut m = Vec::new();
+        let mut v = Vec::new();
+        for p in &params {
+            let numel = p.shape().numel();
+            m.push(QuantizedState::new(numel, 256));
+            v.push(QuantizedState::new(numel, 256));
+        }
+        Self {
+            params,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            m,
+            v,
+            t: 0,
+        }
+    }
+
+    /// Performs a single optimization step.
+    pub fn step(&mut self) {
+        self.t += 1;
+        for (i, p) in self.params.iter().enumerate() {
+            if let Some(grad) = p.grad() {
+                let grad_contiguous = grad.contiguous();
+                let numel = p.shape().numel();
+
+                // Allocate temporary float buffers
+                let mut m_f32 = vec![0.0f32; numel];
+                let mut v_f32 = vec![0.0f32; numel];
+
+                // Dequantize states
+                self.m[i].dequantize(&mut m_f32);
+                self.v[i].dequantize(&mut v_f32);
+
+                // Perform update step
+                p.adamw_step(
+                    &grad_contiguous,
+                    &mut m_f32,
+                    &mut v_f32,
+                    self.t,
+                    self.lr,
+                    self.beta1,
+                    self.beta2,
+                    self.eps,
+                    self.weight_decay,
+                );
+
+                // Re-quantize updated states
+                self.m[i].quantize(&m_f32);
+                self.v[i].quantize(&v_f32);
+            }
+        }
+    }
+
+    /// The current learning rate.
+    #[must_use]
+    pub const fn lr(&self) -> f32 {
+        self.lr
+    }
+
+    /// Sets the learning rate.
+    pub const fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+}
+
 /// Learning-rate schedule: linear warmup, then cosine decay to `min_lr`.
 ///
 /// Matches the nanoGPT reference schedule so training runs stay comparable:
@@ -288,5 +456,48 @@ mod tests {
         let g = x.grad().unwrap();
         assert!((g.get_f32(0) - 3.0).abs() < 1e-3);
         assert!((g.get_f32(1) - 4.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_adamw_8bit_step() {
+        vearo_backend_cpu::init();
+        vearo_autograd::init();
+
+        let w_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        
+        // Standard AdamW
+        let w_std = Tensor::from_f32(&w_data, [4]);
+        w_std.set_requires_grad(true);
+        let mut opt_std = AdamW::new(vec![w_std.clone()], 0.1, 0.9, 0.999, 1e-8, 0.01);
+
+        // 8-bit AdamW
+        let w_8bit = Tensor::from_f32(&w_data, [4]);
+        w_8bit.set_requires_grad(true);
+        let mut opt_8bit = AdamW8bit::new(vec![w_8bit.clone()], 0.1, 0.9, 0.999, 1e-8, 0.01);
+
+        for _ in 0..5 {
+            // Standard step
+            vearo_autograd::zero_gradients();
+            vearo_autograd::reset_active_tape();
+            let loss_std = w_std.mul(&w_std).sum(0, false);
+            loss_std.backward();
+            opt_std.step();
+
+            // 8-bit step
+            vearo_autograd::zero_gradients();
+            vearo_autograd::reset_active_tape();
+            let loss_8bit = w_8bit.mul(&w_8bit).sum(0, false);
+            loss_8bit.backward();
+            opt_8bit.step();
+        }
+
+        // Verify that 8-bit AdamW matches standard AdamW within a tiny quantization error tolerance (e.g. 1e-2)
+        let val_std = w_std.to_vec_f32();
+        let val_8bit = w_8bit.to_vec_f32();
+        println!("Std AdamW weights: {val_std:?}");
+        println!("8-bit AdamW weights: {val_8bit:?}");
+        for i in 0..4 {
+            assert!((val_std[i] - val_8bit[i]).abs() < 1e-2);
+        }
     }
 }

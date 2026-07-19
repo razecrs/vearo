@@ -16,6 +16,7 @@ pub use vearo_nn as nn;
 pub use vearo_optim as optim;
 
 /// Terminal dashboard for training runs.
+pub mod checkpoint;
 pub mod metrics;
 pub mod tui;
 
@@ -23,6 +24,8 @@ pub mod tui;
 pub use vearo_core::{DType, Device, Shape, Tensor};
 /// Training vs evaluation mode control (affects layers like dropout).
 pub use vearo_core::{is_training, set_training};
+/// Activation checkpointing.
+pub use vearo_autograd::checkpoint;
 
 /// Initializes the backend and autograd engine. Registers both CPU and CUDA backends.
 ///

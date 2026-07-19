@@ -45,6 +45,8 @@ pub fn init() {
             avgpool2d_backward,
             batchnorm,
             batchnorm_backward,
+            fused_attention,
+            fused_attention_backward,
         },
     );
 }
@@ -1396,7 +1398,11 @@ pub fn avgpool2d_backward(
 
 /// 2D Batch Normalization forward on CPU (NCHW).
 #[must_use]
-#[allow(clippy::many_single_char_names, clippy::similar_names, clippy::too_many_arguments)]
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::too_many_arguments
+)]
 pub fn batchnorm(
     x: &Tensor,
     gamma: &Tensor,
@@ -1410,7 +1416,11 @@ pub fn batchnorm(
     assert_eq!(x.dtype(), vearo_core::DType::F32, "Only F32 supported");
     let xc = x.contiguous();
     let dims = xc.shape().dims();
-    assert_eq!(dims.len(), 4, "BatchNorm2d input must be rank 4 (N, C, H, W)");
+    assert_eq!(
+        dims.len(),
+        4,
+        "BatchNorm2d input must be rank 4 (N, C, H, W)"
+    );
     let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
     let m = (n * h * w) as f32;
 
@@ -1470,7 +1480,8 @@ pub fn batchnorm(
         for cc in 0..c {
             rm_data_new[cc] = (1.0 - momentum) * rm_data_orig[cc] + momentum * mean_batch[cc];
             let bessel = if m > 1.0 { m / (m - 1.0) } else { 1.0 };
-            rv_data_new[cc] = (1.0 - momentum) * rv_data_orig[cc] + momentum * var_batch[cc] * bessel;
+            rv_data_new[cc] =
+                (1.0 - momentum) * rv_data_orig[cc] + momentum * var_batch[cc] * bessel;
         }
         write_f32(running_mean, rm_data_new);
         write_f32(running_var, rv_data_new);
@@ -1523,7 +1534,12 @@ pub fn batchnorm(
 
 /// 2D Batch Normalization backward on CPU (NCHW).
 #[must_use]
-#[allow(clippy::many_single_char_names, clippy::similar_names, clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub fn batchnorm_backward(
     x: &Tensor,
     gamma: &Tensor,
@@ -1626,7 +1642,8 @@ pub fn batchnorm_backward(
                         let idx = ((nn * c + cc) * h + hh) * w + ww;
                         let dy = go_data[idx];
                         let x_hat = (x_data[idx] - mean) * inv_std;
-                        let gx = (gamma_val * inv_std / m) * (m * dy - sum_dy - x_hat * sum_dy_xhat);
+                        let gx =
+                            (gamma_val * inv_std / m) * (m * dy - sum_dy - x_hat * sum_dy_xhat);
                         gx_data[idx] = gx;
                     }
                 }
@@ -1683,6 +1700,272 @@ pub fn batchnorm_backward(
     write_f32(&grad_w, gw_data);
     write_f32(&grad_b, gb_data);
     (grad_x, grad_w, grad_b)
+}
+
+/// Fused scaled dot-product attention forward pass on CPU.
+#[allow(clippy::many_single_char_names, clippy::needless_range_loop)]
+pub fn fused_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Tensor {
+    assert_eq!(q.dtype(), vearo_core::DType::F32);
+    assert_eq!(k.dtype(), vearo_core::DType::F32);
+    assert_eq!(v.dtype(), vearo_core::DType::F32);
+
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    let v_shape = v.shape().dims();
+
+    let b = q_shape[0];
+    let h = q_shape[1];
+    let s = q_shape[2];
+    let d_k = q_shape[3];
+
+    assert_eq!(k_shape, q_shape);
+    assert_eq!(v_shape, q_shape);
+
+    let q_cont = q.contiguous();
+    let k_cont = k.contiguous();
+    let v_cont = v.contiguous();
+
+    let q_data = read_f32(&q_cont);
+    let k_data = read_f32(&k_cont);
+    let v_data = read_f32(&v_cont);
+
+    let mask_cont = mask.map(Tensor::contiguous);
+    let mask_data = mask_cont.as_ref().map(read_f32);
+    // Right-align the mask shape to rank 4. The unfused path adds the mask with
+    // broadcasting, so a causal mask is usually [S, S] rather than [B, H, S, S];
+    // indexing a shorter shape directly panics. Left-padding with ones keeps the
+    // fused path a drop-in replacement for the broadcast add.
+    let mask_shape = mask_cont.as_ref().map(|m| {
+        let dims = m.shape().dims().to_vec();
+        let mut padded = vec![1usize; 4_usize.saturating_sub(dims.len())];
+        padded.extend(dims);
+        padded
+    });
+
+    let scale = 1.0 / (d_k as f32).sqrt();
+    let mut out_data = vec![0.0f32; b * h * s * d_k];
+
+    let bh_stride = s * d_k;
+    let b_stride = h * bh_stride;
+
+    for b_idx in 0..b {
+        for h_idx in 0..h {
+            let offset = b_idx * b_stride + h_idx * bh_stride;
+
+            for i in 0..s {
+                let q_row = &q_data[(offset + i * d_k)..(offset + (i + 1) * d_k)];
+
+                let mut scores = vec![0.0f32; s];
+                let mut max_score = -f32::INFINITY;
+
+                for j in 0..s {
+                    let k_row = &k_data[(offset + j * d_k)..(offset + (j + 1) * d_k)];
+                    let mut dot = 0.0f32;
+                    for d in 0..d_k {
+                        dot = q_row[d].mul_add(k_row[d], dot);
+                    }
+                    dot *= scale;
+
+                    if let Some(ref m_data) = mask_data {
+                        let m_shape = mask_shape.as_ref().unwrap();
+                        let mb = if m_shape[0] == 1 { 0 } else { b_idx };
+                        let mh = if m_shape[1] == 1 { 0 } else { h_idx };
+                        let ms = if m_shape[2] == 1 { 0 } else { i };
+                        let ms_col = if m_shape[3] == 1 { 0 } else { j };
+
+                        let m_idx = mb * (m_shape[1] * m_shape[2] * m_shape[3])
+                            + mh * (m_shape[2] * m_shape[3])
+                            + ms * m_shape[3]
+                            + ms_col;
+                        dot += m_data[m_idx];
+                    }
+
+                    scores[j] = dot;
+                    if dot > max_score {
+                        max_score = dot;
+                    }
+                }
+
+                let mut sum_exp = 0.0f32;
+                for j in 0..s {
+                    scores[j] = (scores[j] - max_score).exp();
+                    sum_exp += scores[j];
+                }
+                let inv_sum = 1.0 / (sum_exp + 1e-9);
+                for j in 0..s {
+                    scores[j] *= inv_sum;
+                }
+
+                let out_row_offset = offset + i * d_k;
+                for d in 0..d_k {
+                    let mut sum_val = 0.0f32;
+                    for j in 0..s {
+                        let v_val = v_data[offset + j * d_k + d];
+                        sum_val = scores[j].mul_add(v_val, sum_val);
+                    }
+                    out_data[out_row_offset + d] = sum_val;
+                }
+            }
+        }
+    }
+
+    let out = Tensor::zeros(*q.shape(), vearo_core::DType::F32);
+    write_f32(&out, out_data);
+    out
+}
+
+/// Fused scaled dot-product attention backward pass on CPU.
+#[allow(clippy::many_single_char_names, clippy::needless_range_loop, clippy::too_many_lines)]
+pub fn fused_attention_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    grad_out: &Tensor,
+) -> (Tensor, Tensor, Tensor) {
+    let q_shape = q.shape().dims();
+    let b = q_shape[0];
+    let h = q_shape[1];
+    let s = q_shape[2];
+    let d_k = q_shape[3];
+
+    let q_cont = q.contiguous();
+    let k_cont = k.contiguous();
+    let v_cont = v.contiguous();
+    let go_cont = grad_out.contiguous();
+
+    let q_data = read_f32(&q_cont);
+    let k_data = read_f32(&k_cont);
+    let v_data = read_f32(&v_cont);
+    let go_data = read_f32(&go_cont);
+
+    let mask_cont = mask.map(Tensor::contiguous);
+    let mask_data = mask_cont.as_ref().map(read_f32);
+    // Right-align the mask shape to rank 4. The unfused path adds the mask with
+    // broadcasting, so a causal mask is usually [S, S] rather than [B, H, S, S];
+    // indexing a shorter shape directly panics. Left-padding with ones keeps the
+    // fused path a drop-in replacement for the broadcast add.
+    let mask_shape = mask_cont.as_ref().map(|m| {
+        let dims = m.shape().dims().to_vec();
+        let mut padded = vec![1usize; 4_usize.saturating_sub(dims.len())];
+        padded.extend(dims);
+        padded
+    });
+
+    let scale = 1.0 / (d_k as f32).sqrt();
+
+    let mut dq_data = vec![0.0f32; b * h * s * d_k];
+    let mut dk_data = vec![0.0f32; b * h * s * d_k];
+    let mut dv_data = vec![0.0f32; b * h * s * d_k];
+
+    let bh_stride = s * d_k;
+    let b_stride = h * bh_stride;
+
+    for b_idx in 0..b {
+        for h_idx in 0..h {
+            let offset = b_idx * b_stride + h_idx * bh_stride;
+
+            for i in 0..s {
+                let q_row = &q_data[(offset + i * d_k)..(offset + (i + 1) * d_k)];
+
+                let mut scores = vec![0.0f32; s];
+                let mut max_score = -f32::INFINITY;
+
+                for j in 0..s {
+                    let k_row = &k_data[(offset + j * d_k)..(offset + (j + 1) * d_k)];
+                    let mut dot = 0.0f32;
+                    for d in 0..d_k {
+                        dot = q_row[d].mul_add(k_row[d], dot);
+                    }
+                    dot *= scale;
+
+                    if let Some(ref m_data) = mask_data {
+                        let m_shape = mask_shape.as_ref().unwrap();
+                        let mb = if m_shape[0] == 1 { 0 } else { b_idx };
+                        let mh = if m_shape[1] == 1 { 0 } else { h_idx };
+                        let ms = if m_shape[2] == 1 { 0 } else { i };
+                        let ms_col = if m_shape[3] == 1 { 0 } else { j };
+
+                        let m_idx = mb * (m_shape[1] * m_shape[2] * m_shape[3])
+                            + mh * (m_shape[2] * m_shape[3])
+                            + ms * m_shape[3]
+                            + ms_col;
+                        dot += m_data[m_idx];
+                    }
+
+                    scores[j] = dot;
+                    if dot > max_score {
+                        max_score = dot;
+                    }
+                }
+
+                let mut sum_exp = 0.0f32;
+                for j in 0..s {
+                    scores[j] = (scores[j] - max_score).exp();
+                    sum_exp += scores[j];
+                }
+                let inv_sum = 1.0 / (sum_exp + 1e-9);
+                for j in 0..s {
+                    scores[j] *= inv_sum;
+                }
+
+                let go_row = &go_data[(offset + i * d_k)..(offset + (i + 1) * d_k)];
+                let mut dp = vec![0.0f32; s];
+                for j in 0..s {
+                    let mut sum_val = 0.0f32;
+                    for d in 0..d_k {
+                        sum_val = go_row[d].mul_add(v_data[offset + j * d_k + d], sum_val);
+                    }
+                    dp[j] = sum_val;
+                }
+
+                let mut sum_dp_p = 0.0f32;
+                for j in 0..s {
+                    sum_dp_p = dp[j].mul_add(scores[j], sum_dp_p);
+                }
+
+                let mut ds = vec![0.0f32; s];
+                for j in 0..s {
+                    ds[j] = scores[j] * (dp[j] - sum_dp_p);
+                }
+
+                let dq_row_offset = offset + i * d_k;
+                for d in 0..d_k {
+                    let mut sum_val = 0.0f32;
+                    for j in 0..s {
+                        sum_val = ds[j].mul_add(k_data[offset + j * d_k + d], sum_val);
+                    }
+                    dq_data[dq_row_offset + d] = sum_val * scale;
+                }
+
+                for j in 0..s {
+                    let dv_idx = offset + j * d_k;
+                    let p_ij = scores[j];
+                    for d in 0..d_k {
+                        dv_data[dv_idx + d] = p_ij.mul_add(go_row[d], dv_data[dv_idx + d]);
+                    }
+                }
+
+                for j in 0..s {
+                    let dk_idx = offset + j * d_k;
+                    let ds_ij = ds[j] * scale;
+                    for d in 0..d_k {
+                        dk_data[dk_idx + d] = ds_ij.mul_add(q_row[d], dk_data[dk_idx + d]);
+                    }
+                }
+            }
+        }
+    }
+
+    let dq = Tensor::zeros(*q.shape(), vearo_core::DType::F32);
+    let dk = Tensor::zeros(*q.shape(), vearo_core::DType::F32);
+    let dv = Tensor::zeros(*q.shape(), vearo_core::DType::F32);
+
+    write_f32(&dq, dq_data);
+    write_f32(&dk, dk_data);
+    write_f32(&dv, dv_data);
+
+    (dq, dk, dv)
 }
 
 #[cfg(test)]

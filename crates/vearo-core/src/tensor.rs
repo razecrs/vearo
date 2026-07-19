@@ -809,6 +809,46 @@ impl Tensor {
         }
     }
 
+    /// Overwrites the content of a contiguous F32 tensor with a slice of floats.
+    ///
+    /// # Panics
+    /// Panics if the tensor is non-contiguous, not F32, or slice size doesn't match tensor size.
+    pub fn copy_from_slice(&self, src: &[f32]) {
+        assert!(
+            self.is_contiguous(),
+            "copy_from_slice requires contiguous tensor"
+        );
+        let numel = self.shape().numel();
+        assert_eq!(
+            src.len(),
+            numel,
+            "Source slice length must match tensor numel"
+        );
+        if self.device.is_cpu() {
+            let mut guard = get_cpu_shard(self.storage_id.shard_idx as usize)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = guard.slots[self.storage_id.slot_idx as usize]
+                .as_mut()
+                .unwrap();
+            match &mut slot.storage {
+                CpuStorage::F32(vec) => {
+                    let vec_mut = std::sync::Arc::make_mut(vec);
+                    vec_mut.copy_from_slice(src);
+                }
+                _ => panic!("Expected F32 storage"),
+            }
+            drop(guard);
+        } else if self.device.is_cuda() {
+            let write = CUDA_WRITE_HOOK
+                .get()
+                .expect("CUDA write hook not registered");
+            write(self.storage_id, src);
+        } else {
+            panic!("Unsupported device: {:?}", self.device);
+        }
+    }
+
     /// In-place scaled addition: `self += scale * other`.
     ///
     /// # Panics
@@ -1118,7 +1158,20 @@ pub struct BackendOps {
     pub batchnorm: fn(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, bool, f32, f32) -> Tensor,
     /// Two-dimensional batch normalization backward.
     #[allow(clippy::too_many_arguments)]
-    pub batchnorm_backward: fn(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, bool, f32) -> (Tensor, Tensor, Tensor),
+    pub batchnorm_backward: fn(
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        bool,
+        f32,
+    ) -> (Tensor, Tensor, Tensor),
+    /// Fused attention forward: returns output tensor.
+    pub fused_attention: fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>) -> Tensor,
+    /// Fused attention backward: returns (`grad_q`, `grad_k`, `grad_v`).
+    pub fused_attention_backward: fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>, &Tensor) -> (Tensor, Tensor, Tensor),
 }
 
 /// Per-backend registry of op implementations, indexed by [`Device::backend_idx`].
@@ -1134,6 +1187,12 @@ static BACKEND_OPS: [std::sync::OnceLock<BackendOps>; crate::NUM_BACKENDS] =
 /// safe to call from every test and at application startup without coordination.
 pub fn register_backend_ops(device: Device, ops: BackendOps) {
     let _ = BACKEND_OPS[device.backend_idx()].set(ops);
+}
+
+/// Returns the backend ops for a given device, if registered.
+#[must_use]
+pub fn get_backend_ops(device: Device) -> Option<&'static BackendOps> {
+    BACKEND_OPS[device.backend_idx()].get()
 }
 
 thread_local! {
@@ -1586,6 +1645,43 @@ impl Tensor {
         out
     }
 
+    /// Fused Scaled Dot-Product Attention forward.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn fused_attention(&self, k: &Self, v: &Self, mask: Option<&Self>) -> Self {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        let mut out = (ops.fused_attention)(self, k, v, mask);
+
+        if is_autograd_enabled() && (self.requires_grad() || k.requires_grad() || v.requires_grad()) {
+            out.set_requires_grad(true);
+            if let Some(record) = RECORD_OP.get() {
+                if let Some(m) = mask {
+                    record("fused_attention", &[self, k, v, m], &mut out);
+                } else {
+                    record("fused_attention", &[self, k, v], &mut out);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Fused Scaled Dot-Product Attention backward. Used internally by autograd.
+    ///
+    /// # Panics
+    /// Panics if no backend is registered for this device.
+    #[must_use]
+    pub fn fused_attention_backward(&self, k: &Self, v: &Self, mask: Option<&Self>, grad_out: &Self) -> (Self, Self, Self) {
+        let ops = BACKEND_OPS[self.device().backend_idx()]
+            .get()
+            .expect("No backend registered for this device. Did you call the backend's init()?");
+        (ops.fused_attention_backward)(self, k, v, mask, grad_out)
+    }
+
     /// Categorical cross-entropy loss backward. Used internally by autograd.
     ///
     /// # Panics
@@ -1745,8 +1841,16 @@ impl Tensor {
         momentum: f32,
         eps: f32,
     ) -> Self {
-        assert_eq!(self.device(), gamma.device(), "Tensors must reside on the same device");
-        assert_eq!(self.device(), beta.device(), "Tensors must reside on the same device");
+        assert_eq!(
+            self.device(),
+            gamma.device(),
+            "Tensors must reside on the same device"
+        );
+        assert_eq!(
+            self.device(),
+            beta.device(),
+            "Tensors must reside on the same device"
+        );
         let ops = BACKEND_OPS[self.device().backend_idx()]
             .get()
             .expect("No backend registered for this device. Did you call the backend's init()?");
@@ -1761,7 +1865,9 @@ impl Tensor {
             eps,
         );
 
-        if is_autograd_enabled() && (self.requires_grad() || gamma.requires_grad() || beta.requires_grad()) {
+        if is_autograd_enabled()
+            && (self.requires_grad() || gamma.requires_grad() || beta.requires_grad())
+        {
             out.set_requires_grad(true);
             if let Some(record) = RECORD_OP.get() {
                 record(

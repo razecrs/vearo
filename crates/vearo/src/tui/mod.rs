@@ -76,7 +76,8 @@ struct Theme {
 impl Theme {
     /// Detects terminal capabilities from the environment.
     fn detect() -> Self {
-        let forced_ascii = std::env::var("VEARO_TUI").is_ok_and(|v| v.eq_ignore_ascii_case("ascii"));
+        let forced_ascii =
+            std::env::var("VEARO_TUI").is_ok_and(|v| v.eq_ignore_ascii_case("ascii"));
         let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
         let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
@@ -479,10 +480,9 @@ impl TrainingMonitor {
         for i in 0..BAR_W {
             if i < filled {
                 // gradient violet -> teal across the filled span
-                bar.push_str(&t.paint(
-                    t.bar_full(),
-                    lerp(ACCENT2, ACCENT, i as f32 / BAR_W as f32),
-                ));
+                bar.push_str(
+                    &t.paint(t.bar_full(), lerp(ACCENT2, ACCENT, i as f32 / BAR_W as f32)),
+                );
             } else {
                 bar.push_str(&t.paint(t.bar_empty(), DIM));
             }

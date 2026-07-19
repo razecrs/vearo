@@ -101,6 +101,10 @@ pub enum OpType {
         /// Numerical stability epsilon represented as bits.
         eps_bits: u32,
     },
+    /// Activation checkpointing node.
+    Checkpoint,
+    /// Fused Scaled Dot-Product Attention.
+    FusedAttention,
 }
 
 /// A node in the autograd computation graph.
@@ -195,6 +199,15 @@ thread_local! {
     /// the other's gradient.
     pub static GRADIENTS: RefCell<HashMap<(StorageId, Device), Tensor>> =
         RefCell::new(HashMap::default());
+
+    /// Thread-local registry of activation checkpoint closures.
+    #[allow(clippy::type_complexity)]
+    pub static CHECKPOINT_REGISTRY: RefCell<HashMap<u32, std::rc::Rc<dyn Fn(&Tensor) -> Tensor>>> =
+        RefCell::new(HashMap::new());
+
+    /// Thread-local storage for checkpoint block gradients.
+    pub static CHECKPOINT_GRADIENTS: RefCell<HashMap<(StorageId, Device), Tensor>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Parses a `"<dim>_<keepbit>"` reduction op-name suffix into `(dim, keep_dim)`.
@@ -278,6 +291,7 @@ fn record_op_callback(op_name: &str, inputs: &[&Tensor], output: &mut Tensor) {
             "gelu" => OpType::Gelu,
             "embedding" => OpType::Embedding,
             "cross_entropy" => OpType::CrossEntropy,
+            "fused_attention" => OpType::FusedAttention,
             _ => panic!("Unknown operation to record: {op_name}"),
         }
     };
@@ -403,9 +417,9 @@ fn expand_reduce_grad(
     zeros.add(&grad_keep)
 }
 
-/// Dynamic backward pass execution callback.
-#[allow(clippy::too_many_lines)]
-fn backward_callback(output: &Tensor) {
+/// Runs the backward pass starting from the given output tensor and its gradient.
+#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+pub fn backward_impl(output: &Tensor, grad: &Tensor) {
     // Disable tape recording during backward pass execution
     set_autograd_enabled(false);
 
@@ -421,10 +435,8 @@ fn backward_callback(output: &Tensor) {
     // 2. Map from node index to accumulated gradient Tensor
     let mut grad_map: HashMap<u32, Tensor> = HashMap::new();
 
-    // 3. Initialize output gradient to ones
-    let out_grad = Tensor::from_f32(&[1.0], *output.shape()).to(output.device());
-    grad_map.insert(output_idx, out_grad);
-
+    // 3. Initialize output gradient
+    grad_map.insert(output_idx, grad.clone());
     // 4. Backward execution through reverse topological sort (simply reverse tape order)
     for node in nodes.iter().rev() {
         let grad_out = match grad_map.get(&node.id) {
@@ -547,13 +559,23 @@ fn backward_callback(output: &Tensor) {
                 let running_mean = &node.saved_tensors[3];
                 let running_var = &node.saved_tensors[4];
                 let eps = f32::from_bits(*eps_bits);
-                let (gx, gw, gb) = x.batchnorm_backward(gamma, beta, running_mean, running_var, &grad_out, *training, eps);
+                let (gx, gw, gb) = x.batchnorm_backward(
+                    gamma,
+                    beta,
+                    running_mean,
+                    running_var,
+                    &grad_out,
+                    *training,
+                    eps,
+                );
                 vec![
                     gx,
                     gw,
                     gb,
-                    Tensor::zeros(*running_mean.shape(), vearo_core::DType::F32).to(running_mean.device()),
-                    Tensor::zeros(*running_var.shape(), vearo_core::DType::F32).to(running_var.device()),
+                    Tensor::zeros(*running_mean.shape(), vearo_core::DType::F32)
+                        .to(running_mean.device()),
+                    Tensor::zeros(*running_var.shape(), vearo_core::DType::F32)
+                        .to(running_var.device()),
                 ]
             }
             OpType::Embedding => {
@@ -567,6 +589,19 @@ fn backward_callback(output: &Tensor) {
                 let targets = &node.saved_tensors[1];
                 let gl = logits.cross_entropy_backward(targets, &grad_out);
                 vec![gl, Tensor::zeros(*targets.shape(), vearo_core::DType::F32)]
+            }
+            OpType::FusedAttention => {
+                let q = &node.saved_tensors[0];
+                let k = &node.saved_tensors[1];
+                let v = &node.saved_tensors[2];
+                let mask = node.saved_tensors.get(3);
+
+                let (dq, dk, dv) = q.fused_attention_backward(k, v, mask, &grad_out);
+                let mut grads = vec![dq, dk, dv];
+                if let Some(m) = mask {
+                    grads.push(Tensor::zeros(*m.shape(), vearo_core::DType::F32));
+                }
+                grads
             }
             OpType::Conv2d { stride, padding } => {
                 let input = &node.saved_tensors[0];
@@ -603,6 +638,74 @@ fn backward_callback(output: &Tensor) {
                 let count = x.shape().dims()[*dim] as f32;
                 let scale = Tensor::from_f32(&[1.0 / count], [1]).to(expanded.device());
                 vec![expanded.mul(&scale)]
+            }
+            OpType::Checkpoint => {
+                let x = &node.saved_tensors[0];
+                let f = CHECKPOINT_REGISTRY.with(|reg| {
+                    reg.borrow_mut().remove(&node.id)
+                }).expect("Checkpoint closure not found in registry");
+
+                // Save parent tape's node IDs of all possible inputs/parameters
+                let mut parent_node_ids = HashMap::new();
+                parent_node_ids.insert((x.storage_id(), x.device()), x.node_id());
+
+                for n in &nodes {
+                    for t in &n.saved_tensors {
+                        parent_node_ids.insert((t.storage_id(), t.device()), t.node_id());
+                    }
+                }
+
+                set_autograd_enabled(true);
+                let parent_gen = TAPE.with(|t| t.borrow().generation);
+                let local_tape = Tape {
+                    generation: parent_gen.wrapping_add(1),
+                    ..Default::default()
+                };
+                let old_tape = TAPE.with(|t| t.replace(local_tape));
+                let old_grads = GRADIENTS.with(|g| g.replace(HashMap::new()));
+
+                let y_new = f(x);
+                set_autograd_enabled(false);
+                backward_impl(&y_new, &grad_out);
+
+                let local_nodes = TAPE.with(|t| t.borrow().nodes.clone());
+
+                TAPE.with(|t| t.replace(old_tape));
+
+                // Clear node ID of all local tape tensors to None
+                for n in &local_nodes {
+                    for t in &n.saved_tensors {
+                        t.set_node_id(None);
+                    }
+                }
+
+                // Restore parent node IDs of all parent tensors directly in `nodes`
+                for n in &nodes {
+                    for t in &n.saved_tensors {
+                        if let Some(&parent_id) = parent_node_ids.get(&(t.storage_id(), t.device())) {
+                            t.set_node_id(parent_id);
+                        }
+                    }
+                }
+                if let Some(&parent_id) = parent_node_ids.get(&(x.storage_id(), x.device())) {
+                    x.set_node_id(parent_id);
+                }
+
+                let mut block_grads = GRADIENTS.with(|g| g.replace(old_grads));
+                let gx = block_grads.remove(&(x.storage_id(), x.device()));
+
+                CHECKPOINT_GRADIENTS.with(|cg| {
+                    let mut cg_ref = cg.borrow_mut();
+                    for (k, v) in block_grads {
+                        if let Some(existing) = cg_ref.get_mut(&k) {
+                            *existing = existing.add(&v);
+                        } else {
+                            cg_ref.insert(k, v);
+                        }
+                    }
+                });
+
+                vec![gx.unwrap_or_else(|| Tensor::zeros(*x.shape(), DType::F32).to(x.device()))]
             }
         };
 
@@ -647,11 +750,30 @@ fn backward_callback(output: &Tensor) {
         }
     });
 
+    // Merge checkpoint gradients
+    let c_grads = CHECKPOINT_GRADIENTS.with(std::cell::RefCell::take);
+    GRADIENTS.with(|g| {
+        let mut g_ref = g.borrow_mut();
+        for (k, v) in c_grads {
+            if let Some(existing) = g_ref.get_mut(&k) {
+                *existing = existing.add(&v);
+            } else {
+                g_ref.insert(k, v);
+            }
+        }
+    });
+
     // 6. Reset the tape to free all references and memory
     TAPE.with(|t| t.borrow_mut().reset());
 
     // Re-enable tape recording
     set_autograd_enabled(true);
+}
+
+/// Dynamic backward pass execution callback.
+fn backward_callback(output: &Tensor) {
+    let out_grad = Tensor::from_f32(&[1.0], *output.shape()).to(output.device());
+    backward_impl(output, &out_grad);
 }
 
 /// Dynamic gradient lookup callback.
@@ -742,8 +864,71 @@ where
     }
 
     set_autograd_enabled(was_enabled);
-
     Tensor::from_f32(&grad_data, *x_contiguous.shape()).to(x.device())
+}
+
+/// Wraps a forward function (such as a neural network layer or block) with activation checkpointing.
+///
+/// During the forward pass, this runs the block with autograd disabled to save memory, storing only
+/// the input tensor. During the backward pass, the block's forward pass is re-evaluated dynamically
+/// to reconstruct the local tape nodes and calculate the gradients.
+#[allow(clippy::missing_panics_doc)]
+pub fn checkpoint<F>(x: &Tensor, f: F) -> Tensor
+where
+    F: Fn(&Tensor) -> Tensor + 'static,
+{
+    let was_enabled = is_autograd_enabled();
+
+    // 1. Run forward pass without autograd recording
+    set_autograd_enabled(false);
+    let out = f(x);
+    set_autograd_enabled(was_enabled);
+
+    if was_enabled && (x.requires_grad() || out.requires_grad()) {
+        out.set_requires_grad(true);
+
+        TAPE.with(|tape| {
+            let mut tape = tape.borrow_mut();
+            let mut input_ids = Vec::with_capacity(1);
+
+            let live_index = x.node_id().and_then(|tok| {
+                let (token_gen, idx) = Tape::unpack(tok);
+                (token_gen == tape.generation).then_some(idx)
+            });
+
+            if let Some(idx) = live_index {
+                input_ids.push(Some(idx));
+            } else if x.requires_grad() {
+                let leaf_id = u32::try_from(tape.nodes.len()).unwrap();
+                tape.nodes.push(Node {
+                    id: leaf_id,
+                    op: OpType::Add, // leaf dummy
+                    inputs: vec![],
+                    saved_tensors: vec![],
+                });
+                x.set_node_id(Some(Tape::pack(tape.generation, leaf_id)));
+                input_ids.push(Some(leaf_id));
+            } else {
+                input_ids.push(None);
+            }
+
+            let id = u32::try_from(tape.nodes.len()).unwrap();
+            tape.nodes.push(Node {
+                id,
+                op: OpType::Checkpoint,
+                inputs: input_ids,
+                saved_tensors: vec![x.clone()],
+            });
+
+            CHECKPOINT_REGISTRY.with(|reg| {
+                reg.borrow_mut().insert(id, std::rc::Rc::new(f));
+            });
+
+            out.set_node_id(Some(Tape::pack(tape.generation, id)));
+        });
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -1366,6 +1551,130 @@ mod tests {
                 ana.get_f32(i),
                 num.get_f32(i)
             );
+        }
+    }
+
+    #[test]
+    fn test_activation_checkpointing() {
+        vearo_backend_cpu::init();
+        init();
+
+        let w_data = vec![2.0f32, -1.0, 3.0, 0.5];
+        let w = Tensor::from_f32(&w_data, [2, 2]);
+        w.set_requires_grad(true);
+
+        let x = Tensor::from_f32(&[1.0, 2.0], [1, 2]);
+        x.set_requires_grad(true);
+
+        // Standard forward and backward
+        let out_std = x.matmul(&w).relu().sum(0, false).sum(0, false);
+        out_std.backward();
+        let grad_x_std = x.grad().unwrap().to_vec_f32();
+        let grad_w_std = w.grad().unwrap().to_vec_f32();
+
+        zero_gradients();
+        reset_active_tape();
+
+        // Checkpoint-enabled forward and backward
+        let w_cloned = w.clone();
+        let forward_block = move |input: &Tensor| {
+            input.matmul(&w_cloned).relu()
+        };
+        let out_ckp = checkpoint(&x, forward_block).sum(0, false).sum(0, false);
+        out_ckp.backward();
+        let grad_x_ckp = x.grad().unwrap().to_vec_f32();
+        let grad_w_ckp = w.grad().unwrap().to_vec_f32();
+
+        // Parity verification
+        assert_eq!(grad_x_std, grad_x_ckp);
+        assert_eq!(grad_w_std, grad_w_ckp);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_fused_attention() {
+        vearo_backend_cpu::init();
+        init();
+
+        let b = 2;
+        let h = 3;
+        let s = 4;
+        let d_k = 5;
+
+        // Generate Q, K, V
+        let q_data: Vec<f32> = (0..b * h * s * d_k).map(|i| (i as f32 * 0.1).sin()).collect();
+        let k_data: Vec<f32> = (0..b * h * s * d_k).map(|i| (i as f32 * 0.15).cos()).collect();
+        let v_data: Vec<f32> = (0..b * h * s * d_k).map(|i| (i as f32 * 0.2).sin()).collect();
+        // Causal mask: lower triangular -inf
+        let mut mask_data = vec![0.0f32; b * h * s * s];
+        for b_idx in 0..b {
+            for h_idx in 0..h {
+                let offset = (b_idx * h + h_idx) * s * s;
+                for i in 0..s {
+                    for j in 0..s {
+                        if j > i {
+                            mask_data[offset + i * s + j] = -1e9;
+                        }
+                    }
+                }
+            }
+        }
+
+        let q_std = Tensor::from_f32(&q_data, [b, h, s, d_k]);
+        let k_std = Tensor::from_f32(&k_data, [b, h, s, d_k]);
+        let v_std = Tensor::from_f32(&v_data, [b, h, s, d_k]);
+        let mask_tensor = Tensor::from_f32(&mask_data, [b, h, s, s]);
+
+        q_std.set_requires_grad(true);
+        k_std.set_requires_grad(true);
+        v_std.set_requires_grad(true);
+
+        // Standard attention computation
+        let k_t = k_std.transpose(2, 3);
+        let scale = Tensor::from_f32(&[1.0 / (d_k as f32).sqrt()], [1]);
+        let scores = q_std.matmul(&k_t).mul(&scale).add(&mask_tensor);
+        let probs = scores.softmax(3);
+        let out_std = probs.matmul(&v_std);
+
+        // Backward
+        let grad_out = Tensor::from_f32(&(0..b * h * s * d_k).map(|i| (i as f32 * 0.05).cos()).collect::<Vec<_>>(), [b, h, s, d_k]);
+        backward_impl(&out_std, &grad_out);
+
+        let grad_q_std = q_std.grad().unwrap().contiguous().to_vec_f32();
+        let grad_k_std = k_std.grad().unwrap().contiguous().to_vec_f32();
+        let grad_v_std = v_std.grad().unwrap().contiguous().to_vec_f32();
+
+        zero_gradients();
+        reset_active_tape();
+
+        // Fused attention
+        let q_fused = Tensor::from_f32(&q_data, [b, h, s, d_k]);
+        let k_fused = Tensor::from_f32(&k_data, [b, h, s, d_k]);
+        let v_fused = Tensor::from_f32(&v_data, [b, h, s, d_k]);
+
+        q_fused.set_requires_grad(true);
+        k_fused.set_requires_grad(true);
+        v_fused.set_requires_grad(true);
+
+        let out_fused = q_fused.fused_attention(&k_fused, &v_fused, Some(&mask_tensor));
+        backward_impl(&out_fused, &grad_out);
+
+        let grad_q_fused = q_fused.grad().unwrap().contiguous().to_vec_f32();
+        let grad_k_fused = k_fused.grad().unwrap().contiguous().to_vec_f32();
+        let grad_v_fused = v_fused.grad().unwrap().contiguous().to_vec_f32();
+
+        // Parity checking
+        let std_out_val = out_std.to_vec_f32();
+        let fused_out_val = out_fused.to_vec_f32();
+        
+        println!("out std: {std_out_val:?}");
+        println!("out fused: {fused_out_val:?}");
+
+        for i in 0..std_out_val.len() {
+            assert!((std_out_val[i] - fused_out_val[i]).abs() < 1e-4);
+            assert!((grad_q_std[i] - grad_q_fused[i]).abs() < 1e-4);
+            assert!((grad_k_std[i] - grad_k_fused[i]).abs() < 1e-4);
+            assert!((grad_v_std[i] - grad_v_fused[i]).abs() < 1e-4);
         }
     }
 }

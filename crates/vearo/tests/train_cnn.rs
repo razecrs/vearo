@@ -22,12 +22,30 @@ use vearo::{Device, Tensor};
 
 /// Resolves a dataset path: `$VEARO_DATA_DIR`, then `<repo>/data/kaggle`, then legacy
 /// developer locations. Populate it with `scripts/setup_data.sh`.
+/// Image side length, matching whatever `scripts/preprocess.py --size N` produced.
+/// Read at runtime so changing resolution needs no recompile:
+///     `python3 scripts/preprocess.py --size 64`
+///     `VEARO_IMG_SIZE=64 cargo test --release -p vearo --test train_cnn -- --ignored`
+fn img_size() -> usize {
+    std::env::var("VEARO_IMG_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32)
+}
+
+/// Floats per image: three channels at `s` by `s`.
+fn px(s: usize) -> usize {
+    3 * s * s
+}
+
+/// Feature count produced by `preprocess_tabular` in scripts/preprocess.py.
+const TAB_FEATURES: usize = 49;
+/// Tabular epochs. Best epoch is picked by validation, so a longer budget is safe.
+const TAB_EPOCHS: usize = 60;
+
 fn get_kaggle_path(relative_suffix: &str) -> String {
     if let Ok(dir) = std::env::var("VEARO_DATA_DIR") {
-        let p = format!("{dir}/{relative_suffix}");
-        if std::path::Path::new(&p).exists() {
-            return p;
-        }
+        return format!("{dir}/{relative_suffix}");
     }
     let repo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/kaggle");
     let p = format!("{repo}/{relative_suffix}");
@@ -51,7 +69,7 @@ fn load_bin_f32_host(path: &str) -> Vec<f32> {
 }
 
 /// Simple host-side data augmentation (random horizontal flips and crops/shifts)
-fn augment_batch(batch_data: &mut [f32], size: usize, rng_seed: &mut u64) {
+fn augment_batch(batch_data: &mut [f32], size: usize, rng_seed: &mut u64, s: usize) {
     // Simple LCG RNG
     fn next_rand(seed: &mut u64) -> u32 {
         *seed = seed
@@ -60,43 +78,46 @@ fn augment_batch(batch_data: &mut [f32], size: usize, rng_seed: &mut u64) {
         (*seed >> 32) as u32
     }
 
+    let plane = s * s;
+    let shift = (s / 8).max(1) as i32; // same relative jitter at any resolution
     for b in 0..size {
-        let img_offset = b * 3072;
-        let img = &mut batch_data[img_offset..img_offset + 3072];
+        let img_offset = b * px(s);
+        let img = &mut batch_data[img_offset..img_offset + px(s)];
 
         // 1. Random Horizontal Flip (50% probability)
         if next_rand(rng_seed) % 2 == 0 {
             for c in 0..3 {
-                let c_offset = c * 1024;
-                for y in 0..32 {
-                    let row_offset = c_offset + y * 32;
-                    for x in 0..16 {
-                        img.swap(row_offset + x, row_offset + (31 - x));
+                let c_offset = c * plane;
+                for y in 0..s {
+                    let row_offset = c_offset + y * s;
+                    for x in 0..s / 2 {
+                        img.swap(row_offset + x, row_offset + (s - 1 - x));
                     }
                 }
             }
         }
 
         // 2. Random Translation / Shift (up to +/- 4 pixels with zero padding)
-        let dx = (next_rand(rng_seed) % 9) as i32 - 4; // -4, -3, -2, -1, 0, 1, 2, 3, 4
-        let dy = (next_rand(rng_seed) % 9) as i32 - 4;
+        let span = (shift * 2 + 1) as u32;
+        let dx = (next_rand(rng_seed) % span) as i32 - shift;
+        let dy = (next_rand(rng_seed) % span) as i32 - shift;
 
         if dx != 0 || dy != 0 {
-            let mut temp = vec![0.0f32; 3072];
+            let mut temp = vec![0.0f32; px(s)];
             for c in 0..3 {
-                let c_offset = c * 1024;
-                for y in 0..32 {
+                let c_offset = c * plane;
+                for y in 0..s {
                     let target_y = y as i32 + dy;
-                    if target_y < 0 || target_y >= 32 {
+                    if target_y < 0 || target_y >= s as i32 {
                         continue;
                     }
-                    for x in 0..32 {
+                    for x in 0..s {
                         let target_x = x as i32 + dx;
-                        if target_x < 0 || target_x >= 32 {
+                        if target_x < 0 || target_x >= s as i32 {
                             continue;
                         }
-                        let src_idx = c_offset + y * 32 + x;
-                        let dest_idx = c_offset + (target_y as usize) * 32 + (target_x as usize);
+                        let src_idx = c_offset + y * s + x;
+                        let dest_idx = c_offset + (target_y as usize) * s + (target_x as usize);
                         temp[dest_idx] = img[src_idx];
                     }
                 }
@@ -115,7 +136,7 @@ struct TabularMlp {
 impl TabularMlp {
     fn new() -> Self {
         Self {
-            fc1: vearo::nn::Linear::new(46, 64, true, 42),
+            fc1: vearo::nn::Linear::new(TAB_FEATURES, 64, true, 42),
             fc2: vearo::nn::Linear::new(64, 32, true, 43),
             fc3: vearo::nn::Linear::new(32, 1, true, 44),
         }
@@ -130,13 +151,59 @@ impl TabularMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        self.fc3.forward(&self.fc2.forward(&self.fc1.forward(x).relu()).relu())
+        self.fc3
+            .forward(&self.fc2.forward(&self.fc1.forward(x).relu()).relu())
     }
 
     fn parameters(&self) -> Vec<Tensor> {
         let mut params = self.fc1.parameters();
         params.extend(self.fc2.parameters());
         params.extend(self.fc3.parameters());
+        params
+    }
+}
+
+#[allow(dead_code)]
+struct TabularResMlp {
+    fc1: vearo::nn::Linear,
+    fc2: vearo::nn::Linear,
+    fc3: vearo::nn::Linear,
+    fc4: vearo::nn::Linear,
+}
+
+#[allow(dead_code)]
+impl TabularResMlp {
+    fn new() -> Self {
+        Self {
+            fc1: vearo::nn::Linear::new(TAB_FEATURES, 128, true, 42),
+            fc2: vearo::nn::Linear::new(128, 128, true, 43),
+            fc3: vearo::nn::Linear::new(128, 64, true, 44),
+            fc4: vearo::nn::Linear::new(64, 1, true, 48),
+        }
+    }
+
+    fn to(&self, device: Device) -> Self {
+        Self {
+            fc1: self.fc1.to(device),
+            fc2: self.fc2.to(device),
+            fc3: self.fc3.to(device),
+            fc4: self.fc4.to(device),
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let h1 = self.fc1.forward(x).relu();
+        let h2 = self.fc2.forward(&h1).relu();
+        let h2_skip = &h1 + &h2;
+        let h3 = self.fc3.forward(&h2_skip).relu();
+        self.fc4.forward(&h3)
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = self.fc1.parameters();
+        params.extend(self.fc2.parameters());
+        params.extend(self.fc3.parameters());
+        params.extend(self.fc4.parameters());
         params
     }
 }
@@ -160,7 +227,13 @@ struct StyleCnn {
 }
 
 impl StyleCnn {
-    fn new() -> Self {
+    /// Three 2x pools, so the feature map is `s / 8` on a side and the
+    /// classifier input is `128 * (s/8)^2`. At 32px that is the original 2048.
+    fn flat_dim(s: usize) -> usize {
+        128 * (s / 8) * (s / 8)
+    }
+
+    fn new(s: usize) -> Self {
         Self {
             conv1: vearo::nn::Conv2d::new(3, 32, 3, 1, 1, true, 42),
             bn1: vearo::nn::BatchNorm2d::new(32, 0.1, 1e-5),
@@ -174,7 +247,7 @@ impl StyleCnn {
             bn3: vearo::nn::BatchNorm2d::new(128, 0.1, 1e-5),
             pool3: vearo::nn::MaxPool2d::new(2, 2, 0),
 
-            fc1: vearo::nn::Linear::new(2048, 128, true, 45),
+            fc1: vearo::nn::Linear::new(Self::flat_dim(s), 128, true, 45),
             dropout: vearo::nn::Dropout::new(0.4, 46),
             fc2: vearo::nn::Linear::new(128, 17, true, 47),
         }
@@ -201,12 +274,19 @@ impl StyleCnn {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let h1 = self.pool1.forward(&self.bn1.forward(&self.conv1.forward(x)).relu());
-        let h2 = self.pool2.forward(&self.bn2.forward(&self.conv2.forward(&h1)).relu());
-        let h3 = self.pool3.forward(&self.bn3.forward(&self.conv3.forward(&h2)).relu());
-        
-        let b = x.shape().dims()[0];
-        let flat = h3.reshape([b, 2048]);
+        let h1 = self
+            .pool1
+            .forward(&self.bn1.forward(&self.conv1.forward(x)).relu());
+        let h2 = self
+            .pool2
+            .forward(&self.bn2.forward(&self.conv2.forward(&h1)).relu());
+        let h3 = self
+            .pool3
+            .forward(&self.bn3.forward(&self.conv3.forward(&h2)).relu());
+
+        let dims = h3.shape().dims().to_vec();
+        let b = dims[0];
+        let flat = h3.reshape([b, dims[1] * dims[2] * dims[3]]);
         let h4 = self.dropout.forward(&self.fc1.forward(&flat).relu());
         self.fc2.forward(&h4)
     }
@@ -228,12 +308,101 @@ impl StyleCnn {
 }
 
 #[test]
-#[ignore = "long training run needing datasets; run scripts/setup_data.sh then: cargo test --release --test train_cnn -- --ignored --nocapture"]
-fn test_train_cnn_full() {
+#[ignore = "run programmatic sweep over hyperparameters for tabular model; cargo test --release --test train_cnn test_sweep_tabular -- --ignored --nocapture"]
+fn test_sweep_tabular() {
     vearo::init();
     let device = Device::Cuda(0);
 
-    // ----------------- 1. Train Tabular Regression Model -----------------
+    let x_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_train.bin"));
+    let y_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_train.bin"));
+    let x_val_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_val.bin"));
+    let y_val_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_val.bin"));
+
+    let tab_val_size = y_val_tab.len();
+    let tab_train_size = y_train_tab.len();
+
+    let tab_val_inputs = Tensor::from_f32(&x_val_tab, vec![tab_val_size, TAB_FEATURES]).to(device);
+    let tab_val_targets = Tensor::from_f32(&y_val_tab, vec![tab_val_size, 1]).to(device);
+
+    let lr_sweep = vec![0.002, 0.005, 0.01];
+    let wd_sweep = vec![0.005, 0.01, 0.02, 0.03, 0.05, 0.1];
+    let bs_sweep = vec![64, 128, 256];
+
+    println!("\n| LR | WD | BS | Best Epoch | Best Val RMSE |");
+    println!("|---|---|---|---|---|");
+
+    for &lr in &lr_sweep {
+        for &wd in &wd_sweep {
+            for &bs in &bs_sweep {
+                let mlp_tab = TabularMlp::new().to(device);
+                let mut opt_tab =
+                    vearo::optim::AdamW::new(mlp_tab.parameters(), lr, 0.9, 0.999, 1e-8, wd);
+
+                let mut best_val = f32::INFINITY;
+                let mut best_epoch = 0;
+
+                let mut current_lr = lr;
+                for epoch in 0..TAB_EPOCHS {
+                    if epoch > 0 && epoch % 15 == 0 {
+                        current_lr *= 0.5;
+                        opt_tab.set_lr(current_lr);
+                    }
+                    for i in (0..tab_train_size).step_by(bs) {
+                        vearo::autograd::zero_gradients();
+                        vearo::autograd::reset_active_tape();
+
+                        let end_idx = std::cmp::min(i + bs, tab_train_size);
+                        let size = end_idx - i;
+
+                        let x_batch = Tensor::from_f32(
+                            &x_train_tab[i * TAB_FEATURES..end_idx * TAB_FEATURES],
+                            vec![size, TAB_FEATURES],
+                        )
+                        .to(device);
+                        let y_batch =
+                            Tensor::from_f32(&y_train_tab[i * 1..end_idx * 1], vec![size, 1])
+                                .to(device);
+
+                        let pred = mlp_tab.forward(&x_batch);
+                        let diff = pred.sub(&y_batch);
+                        let squared = diff.mul(&diff);
+                        let loss = squared.mean(0, false);
+
+                        loss.backward();
+                        opt_tab.step();
+                    }
+
+                    vearo::autograd::zero_gradients();
+                    vearo::autograd::reset_active_tape();
+                    let val_pred = mlp_tab.forward(&tab_val_inputs);
+                    let val_diff = val_pred.sub(&tab_val_targets);
+                    let val_squared = val_diff.mul(&val_diff);
+                    let val_loss = val_squared.mean(0, false).to_vec_f32()[0];
+
+                    if val_loss < best_val {
+                        best_val = val_loss;
+                        best_epoch = epoch + 1;
+                    }
+                }
+                println!(
+                    "| {:.4} | {:.4} | {} | {} | {:.5} |",
+                    lr,
+                    wd,
+                    bs,
+                    best_epoch,
+                    best_val.sqrt()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "run only the tabular regression model; cargo test --release --test train_cnn test_train_tabular_only -- --ignored --nocapture"]
+fn test_train_tabular_only() {
+    vearo::init();
+    let device = Device::Cuda(0);
+
     println!("=== Training Tabular Regression Model ===");
     let x_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_train.bin"));
     let y_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_train.bin"));
@@ -241,17 +410,32 @@ fn test_train_cnn_full() {
     let y_val_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_val.bin"));
     let x_test_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_test.bin"));
 
-    let tab_val_inputs = Tensor::from_f32(&x_val_tab, vec![1200, 46]).to(device);
-    let tab_val_targets = Tensor::from_f32(&y_val_tab, vec![1200, 1]).to(device);
+    let tab_val_size = y_val_tab.len();
+    let tab_train_size = y_train_tab.len();
+    let tab_test_size = x_test_tab.len() / TAB_FEATURES;
+
+    let tab_val_inputs = Tensor::from_f32(&x_val_tab, vec![tab_val_size, TAB_FEATURES]).to(device);
+    let tab_val_targets = Tensor::from_f32(&y_val_tab, vec![tab_val_size, 1]).to(device);
 
     let mlp_tab = TabularMlp::new().to(device);
-    let mut opt_tab = vearo::optim::AdamW::new(mlp_tab.parameters(), 0.005, 0.9, 0.999, 1e-8, 0.0);
+    let mut tab_lr = 0.002f32;
+    // Weight decay: adjustable hyperparameter. Default 0.01, optimal 0.10
+    let mut opt_tab =
+        vearo::optim::AdamW::new(mlp_tab.parameters(), tab_lr, 0.9, 0.999, 1e-8, 0.10);
 
-    let tab_batch_size = 128;
-    let tab_train_size = 4800;
+    let tab_batch_size = 256;
+
+    let mut best_val = f32::INFINITY;
+    let mut best_epoch = 0;
+    let mut best_tab_preds: Vec<f32> = Vec::new();
+    let x_test_t = Tensor::from_f32(&x_test_tab, vec![tab_test_size, TAB_FEATURES]).to(device);
 
     let start_tab = Instant::now();
-    for epoch in 0..30 {
+    for epoch in 0..TAB_EPOCHS {
+        if epoch > 0 && epoch % 15 == 0 {
+            tab_lr *= 0.5;
+            opt_tab.set_lr(tab_lr);
+        }
         let mut epoch_loss = 0.0;
         let mut batches = 0;
         for i in (0..tab_train_size).step_by(tab_batch_size) {
@@ -261,8 +445,13 @@ fn test_train_cnn_full() {
             let end_idx = std::cmp::min(i + tab_batch_size, tab_train_size);
             let size = end_idx - i;
 
-            let x_batch = Tensor::from_f32(&x_train_tab[i * 46..end_idx * 46], vec![size, 46]).to(device);
-            let y_batch = Tensor::from_f32(&y_train_tab[i * 1..end_idx * 1], vec![size, 1]).to(device);
+            let x_batch = Tensor::from_f32(
+                &x_train_tab[i * TAB_FEATURES..end_idx * TAB_FEATURES],
+                vec![size, TAB_FEATURES],
+            )
+            .to(device);
+            let y_batch =
+                Tensor::from_f32(&y_train_tab[i * 1..end_idx * 1], vec![size, 1]).to(device);
 
             let pred = mlp_tab.forward(&x_batch);
             let diff = pred.sub(&y_batch);
@@ -276,30 +465,43 @@ fn test_train_cnn_full() {
             opt_tab.step();
         }
 
-        if (epoch + 1) % 10 == 0 || epoch == 0 {
+        vearo::autograd::zero_gradients();
+        vearo::autograd::reset_active_tape();
+        let val_pred = mlp_tab.forward(&tab_val_inputs);
+        let val_diff = val_pred.sub(&tab_val_targets);
+        let val_squared = val_diff.mul(&val_diff);
+        let val_loss = val_squared.mean(0, false).to_vec_f32()[0];
+
+        if val_loss < best_val {
+            best_val = val_loss;
+            best_epoch = epoch + 1;
             vearo::autograd::zero_gradients();
             vearo::autograd::reset_active_tape();
-            let val_pred = mlp_tab.forward(&tab_val_inputs);
-            let val_diff = val_pred.sub(&tab_val_targets);
-            let val_squared = val_diff.mul(&val_diff);
-            let val_loss = val_squared.mean(0, false).to_vec_f32()[0];
+            best_tab_preds = mlp_tab.forward(&x_test_t).to(Device::Cpu).to_vec_f32();
+        }
 
+        if (epoch + 1) % 10 == 0 || epoch == 0 {
             println!(
-                "Tabular Epoch {:02} | Train Loss: {:.6} | Val Loss: {:.6}",
+                "Tabular Epoch {:02} | Train Loss: {:.6} | Val Loss: {:.6} | Val RMSE: {:.4}",
                 epoch + 1,
                 epoch_loss / batches as f32,
-                val_loss
+                val_loss,
+                val_loss.sqrt()
             );
         }
     }
-    println!("Tabular Training completed in {:.4} seconds.", start_tab.elapsed().as_secs_f64());
+    println!(
+        "Tabular Training completed in {:.4} seconds.",
+        start_tab.elapsed().as_secs_f64()
+    );
 
-    // Generate Tabular Prediction submission.csv
-    println!("Generating tabular submission...");
-    vearo::autograd::zero_gradients();
-    vearo::autograd::reset_active_tape();
-    let x_test_t = Tensor::from_f32(&x_test_tab, vec![2523, 46]).to(device);
-    let tab_preds = mlp_tab.forward(&x_test_t).to(Device::Cpu).to_vec_f32();
+    println!(
+        "Best tabular epoch {best_epoch}: val MSE {best_val:.6}, val RMSE {:.4}",
+        best_val.sqrt()
+    );
+
+    println!("Generating tabular submission from epoch {best_epoch}...");
+    let tab_preds = best_tab_preds;
 
     let tab_sub_path = get_kaggle_path("item_price_submission.csv");
     let mut file_tab = File::create(&tab_sub_path).unwrap();
@@ -308,7 +510,134 @@ fn test_train_cnn_full() {
         writeln!(file_tab, "{},{}", i, val).unwrap();
     }
     println!("Saved tabular submission to: {}\n", tab_sub_path);
+}
 
+#[test]
+#[ignore = "long training run needing datasets; run scripts/setup_data.sh then: cargo test --release --test train_cnn -- --ignored --nocapture"]
+fn test_train_cnn_full() {
+    vearo::init();
+    let device = Device::Cuda(0);
+    let s = img_size();
+
+    // ----------------- 1. Train Tabular Regression Model -----------------
+    println!("=== Training Tabular Regression Model ===");
+    let x_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_train.bin"));
+    let y_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_train.bin"));
+    let x_val_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_val.bin"));
+    let y_val_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_val.bin"));
+    let x_test_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_test.bin"));
+
+    // Sizes come from the data. Hardcoding them silently breaks the moment the
+    // preprocessing split changes, which has already happened once.
+    let tab_val_size = y_val_tab.len();
+    let tab_train_size = y_train_tab.len();
+    let tab_test_size = x_test_tab.len() / TAB_FEATURES;
+
+    let tab_val_inputs = Tensor::from_f32(&x_val_tab, vec![tab_val_size, TAB_FEATURES]).to(device);
+    let tab_val_targets = Tensor::from_f32(&y_val_tab, vec![tab_val_size, 1]).to(device);
+
+    let mlp_tab = TabularMlp::new().to(device);
+    let mut tab_lr = 0.002f32;
+    // Weight decay: adjustable hyperparameter. Default 0.01, optimal 0.10
+    let mut opt_tab =
+        vearo::optim::AdamW::new(mlp_tab.parameters(), tab_lr, 0.9, 0.999, 1e-8, 0.10);
+
+    let tab_batch_size = 256;
+
+    // Best-checkpoint state. Validation loss bottoms out around epoch 10 and
+    // then climbs, so shipping the last epoch ships an overfit model. There is
+    // no in-place tensor copy to restore weights with, so this follows the same
+    // approach the CNN uses below: run test inference at each new best and keep
+    // those predictions.
+    let mut best_val = f32::INFINITY;
+    let mut best_epoch = 0;
+    let mut best_tab_preds: Vec<f32> = Vec::new();
+    let x_test_t = Tensor::from_f32(&x_test_tab, vec![tab_test_size, TAB_FEATURES]).to(device);
+
+    let start_tab = Instant::now();
+    for epoch in 0..TAB_EPOCHS {
+        // Decay the learning rate so the tail of training refines rather than
+        // bounces around the minimum.
+        if epoch > 0 && epoch % 15 == 0 {
+            tab_lr *= 0.5;
+            opt_tab.set_lr(tab_lr);
+        }
+        let mut epoch_loss = 0.0;
+        let mut batches = 0;
+        for i in (0..tab_train_size).step_by(tab_batch_size) {
+            vearo::autograd::zero_gradients();
+            vearo::autograd::reset_active_tape();
+
+            let end_idx = std::cmp::min(i + tab_batch_size, tab_train_size);
+            let size = end_idx - i;
+
+            let x_batch = Tensor::from_f32(
+                &x_train_tab[i * TAB_FEATURES..end_idx * TAB_FEATURES],
+                vec![size, TAB_FEATURES],
+            )
+            .to(device);
+            let y_batch =
+                Tensor::from_f32(&y_train_tab[i * 1..end_idx * 1], vec![size, 1]).to(device);
+
+            let pred = mlp_tab.forward(&x_batch);
+            let diff = pred.sub(&y_batch);
+            let squared = diff.mul(&diff);
+            let loss = squared.mean(0, false);
+
+            epoch_loss += loss.to_vec_f32()[0];
+            batches += 1;
+
+            loss.backward();
+            opt_tab.step();
+        }
+
+        // Validate every epoch: checking every tenth cannot find the true best.
+        vearo::autograd::zero_gradients();
+        vearo::autograd::reset_active_tape();
+        let val_pred = mlp_tab.forward(&tab_val_inputs);
+        let val_diff = val_pred.sub(&tab_val_targets);
+        let val_squared = val_diff.mul(&val_diff);
+        let val_loss = val_squared.mean(0, false).to_vec_f32()[0];
+
+        if val_loss < best_val {
+            best_val = val_loss;
+            best_epoch = epoch + 1;
+            vearo::autograd::zero_gradients();
+            vearo::autograd::reset_active_tape();
+            best_tab_preds = mlp_tab.forward(&x_test_t).to(Device::Cpu).to_vec_f32();
+        }
+
+        if (epoch + 1) % 10 == 0 || epoch == 0 {
+            println!(
+                "Tabular Epoch {:02} | Train Loss: {:.6} | Val Loss: {:.6} | Val RMSE: {:.4}",
+                epoch + 1,
+                epoch_loss / batches as f32,
+                val_loss,
+                val_loss.sqrt()
+            );
+        }
+    }
+    println!(
+        "Tabular Training completed in {:.4} seconds.",
+        start_tab.elapsed().as_secs_f64()
+    );
+
+    println!(
+        "Best tabular epoch {best_epoch}: val MSE {best_val:.6}, val RMSE {:.4}",
+        best_val.sqrt()
+    );
+
+    // Generate Tabular Prediction submission.csv from the BEST epoch, not the last.
+    println!("Generating tabular submission from epoch {best_epoch}...");
+    let tab_preds = best_tab_preds;
+
+    let tab_sub_path = get_kaggle_path("item_price_submission.csv");
+    let mut file_tab = File::create(&tab_sub_path).unwrap();
+    writeln!(file_tab, "row_id,Y").unwrap();
+    for (i, val) in tab_preds.iter().enumerate() {
+        writeln!(file_tab, "{},{}", i, val).unwrap();
+    }
+    println!("Saved tabular submission to: {}\n", tab_sub_path);
 
     // ----------------- 2. Train Image Style CNN Model -----------------
     println!("=== Training Image Style CNN Model ===");
@@ -336,11 +665,20 @@ fn test_train_cnn_full() {
 
     assert_eq!(image_names.len(), 5482, "Image test names count mismatch");
 
-    let cnn = StyleCnn::new().to(device);
-    
+    let cnn = StyleCnn::new(s).to(device);
+
+    let ckp_path = get_kaggle_path("style_cnn_best.ve");
+    if std::path::Path::new(&ckp_path).exists() {
+        println!("   --> Found existing weights checkpoint at {}, loading...", ckp_path);
+        if let Err(e) = vearo::checkpoint::load_checkpoint(&cnn.parameters(), &ckp_path) {
+            eprintln!("warning: failed to load weights checkpoint: {e}");
+        }
+    }
+
     // Base LR = 0.0005, Weight Decay = 0.02
     let mut current_lr = 0.0005f32;
-    let mut opt_img = vearo::optim::AdamW::new(cnn.parameters(), current_lr, 0.9, 0.999, 1e-8, 0.02);
+    let mut opt_img =
+        vearo::optim::AdamW::new(cnn.parameters(), current_lr, 0.9, 0.999, 1e-8, 0.02);
 
     let img_batch_size = 256;
     let img_train_size = 10530;
@@ -355,11 +693,16 @@ fn test_train_cnn_full() {
     if let Some(dir) = std::path::Path::new(&metrics_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut ui = vearo::tui::TrainingMonitor::new("style cnn", &format!("{device:?}"), 75)
+    let num_epochs = std::env::var("VEARO_IMG_EPOCHS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(35);
+
+    let mut ui = vearo::tui::TrainingMonitor::new("style cnn", &format!("{device:?}"), num_epochs)
         .with_metrics(&metrics_path);
 
     let start_cnn = Instant::now();
-    for epoch in 0..75 {
+    for epoch in 0..num_epochs {
         // Learning Rate Decay Schedule: reduce LR by 0.5 every 10 epochs
         if epoch > 0 && epoch % 10 == 0 {
             current_lr *= 0.5;
@@ -379,11 +722,11 @@ fn test_train_cnn_full() {
             let size = end_idx - i;
 
             // Load batch slice and apply host-side data augmentation (stronger +/- 4 shifts)
-            let mut x_batch_vec = x_train_img[i * 3072..end_idx * 3072].to_vec();
-            augment_batch(&mut x_batch_vec, size, &mut rng_seed);
+            let mut x_batch_vec = x_train_img[i * px(s)..end_idx * px(s)].to_vec();
+            augment_batch(&mut x_batch_vec, size, &mut rng_seed, s);
 
-            let x_batch_raw = Tensor::from_f32(&x_batch_vec, vec![size, 3072]).to(device);
-            let x_batch = x_batch_raw.reshape(vec![size, 3, 32, 32]);
+            let x_batch_raw = Tensor::from_f32(&x_batch_vec, vec![size, px(s)]).to(device);
+            let x_batch = x_batch_raw.reshape(vec![size, 3, s, s]);
             let y_batch = Tensor::from_f32(&y_train_img[i * 1..end_idx * 1], vec![size]).to(device);
 
             let pred = cnn.forward(&x_batch);
@@ -411,8 +754,10 @@ fn test_train_cnn_full() {
             let end_idx = std::cmp::min(i + val_batch_size, val_size);
             let size = end_idx - i;
 
-            let x_batch_raw = Tensor::from_f32(&x_val_img[i * 3072..end_idx * 3072], vec![size, 3072]).to(device);
-            let x_batch = x_batch_raw.reshape(vec![size, 3, 32, 32]);
+            let x_batch_raw =
+                Tensor::from_f32(&x_val_img[i * px(s)..end_idx * px(s)], vec![size, px(s)])
+                    .to(device);
+            let x_batch = x_batch_raw.reshape(vec![size, 3, s, s]);
             let y_batch = Tensor::from_f32(&y_val_img[i * 1..end_idx * 1], vec![size]).to(device);
 
             let pred = cnn.forward(&x_batch);
@@ -458,7 +803,7 @@ fn test_train_cnn_full() {
                 "new best val acc {:.2}% - running test inference and saving submission",
                 val_acc * 100.0
             ));
-            
+
             let test_size = 5482;
             let test_batch_size = 256;
             let mut current_img_preds = Vec::with_capacity(test_size * 17);
@@ -470,8 +815,10 @@ fn test_train_cnn_full() {
                 let end_idx = std::cmp::min(i + test_batch_size, test_size);
                 let size = end_idx - i;
 
-                let x_batch_raw = Tensor::from_f32(&x_test_img[i * 3072..end_idx * 3072], vec![size, 3072]).to(device);
-                let x_batch = x_batch_raw.reshape(vec![size, 3, 32, 32]);
+                let x_batch_raw =
+                    Tensor::from_f32(&x_test_img[i * px(s)..end_idx * px(s)], vec![size, px(s)])
+                        .to(device);
+                let x_batch = x_batch_raw.reshape(vec![size, 3, s, s]);
 
                 let pred = cnn.forward(&x_batch).to(Device::Cpu).to_vec_f32();
                 current_img_preds.extend(pred);
@@ -493,13 +840,26 @@ fn test_train_cnn_full() {
                 }
                 writeln!(file_img, "{},{}", image_names[s], max_idx).unwrap();
             }
+
+            // Save weight checkpoint
+            let ckp_path = get_kaggle_path("style_cnn_best.ve");
+            if let Err(e) = vearo::checkpoint::save_checkpoint(&cnn.parameters(), &ckp_path) {
+                eprintln!("warning: could not save weights checkpoint: {e}");
+            }
+
             println!("   --> Saved peak performance submission to disk!");
         }
     }
     ui.finish();
-    println!("CNN Training completed in {:.4} seconds.", start_cnn.elapsed().as_secs_f64());
+    println!(
+        "CNN Training completed in {:.4} seconds.",
+        start_cnn.elapsed().as_secs_f64()
+    );
     println!("CNN Peak Validation Accuracy: {:.2}%", best_val_acc * 100.0);
 
     let peak_vram = vearo::backend_cuda::get_peak_memory();
-    println!("PEAK CUDA VRAM ALLOCATED: {:.3} MB", peak_vram as f64 / 1024.0 / 1024.0);
+    println!(
+        "PEAK CUDA VRAM ALLOCATED: {:.3} MB",
+        peak_vram as f64 / 1024.0 / 1024.0
+    );
 }

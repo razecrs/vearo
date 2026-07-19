@@ -8,6 +8,10 @@
     clippy::expect_fun_call
 )]
 
+// This file exercises the CUDA backend directly, so it only builds with the
+// `cuda` feature. CPU coverage of the same ops lives in the other test files.
+#![cfg(feature = "cuda")]
+
 use std::time::Instant;
 use vearo::nn::Module;
 use vearo::{Device, Tensor};

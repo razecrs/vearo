@@ -28,10 +28,18 @@ fn live_cpu_slots() -> usize {
         .sum()
 }
 
+/// Live CUDA slots: allocated minus those returned to the free list.
+#[cfg(feature = "cuda")]
 fn live_cuda_slots() -> usize {
     let slots = vearo::backend_cuda::CUDA_SLOTS.lock().unwrap().len();
     let free = vearo::backend_cuda::FREE_CUDA_SLOTS.lock().unwrap().len();
     slots - free
+}
+
+/// A CPU-only build holds no device slots, so growth there is always zero.
+#[cfg(not(feature = "cuda"))]
+const fn live_cuda_slots() -> usize {
+    0
 }
 
 /// Runs `iters` full training steps and returns `(cpu_slot_growth, cuda_slot_growth)`.
@@ -105,20 +113,25 @@ fn test_no_memory_growth() {
         cpu_only as f64 / iters as f64
     );
 
-    let (cpu, cuda) = measure_growth(Device::Cuda(0), iters);
-    assert!(
-        cpu <= 0,
-        "CPU arena leaked {} slots over {} CUDA steps ({:.2}/step) - host storage is not \
-         being reclaimed during device training",
-        cpu,
-        iters,
-        cpu as f64 / iters as f64
-    );
-    assert!(
-        cuda <= 0,
-        "CUDA slots leaked {} over {} steps ({:.2}/step)",
-        cuda,
-        iters,
-        cuda as f64 / iters as f64
-    );
+    // The device half needs a registered CUDA backend; a CPU-only build still
+    // gets the host-arena check above.
+    #[cfg(feature = "cuda")]
+    {
+        let (cpu, cuda) = measure_growth(Device::Cuda(0), iters);
+        assert!(
+            cpu <= 0,
+            "CPU arena leaked {} slots over {} CUDA steps ({:.2}/step) - host storage is not \
+             being reclaimed during device training",
+            cpu,
+            iters,
+            cpu as f64 / iters as f64
+        );
+        assert!(
+            cuda <= 0,
+            "CUDA slots leaked {} over {} steps ({:.2}/step)",
+            cuda,
+            iters,
+            cuda as f64 / iters as f64
+        );
+    }
 }

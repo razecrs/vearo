@@ -89,13 +89,34 @@ loss.backward();
 opt.step();
 ```
 
-Swap `Device::Cpu` for `Device::Cuda(0)` and the same code runs on the GPU.
+Swap `Device::Cpu` for `Device::Cuda(0)` and the same code runs on the GPU,
+provided the build enabled the `cuda` feature (see below).
 
 ## Build requirements
 
-The umbrella crate links the CUDA backend, so a CUDA toolkit and an NVIDIA GPU are
-currently required to build the workspace, even for CPU-only use. (Making CUDA an
-optional cargo feature is a good first contribution.)
+Rust, and nothing else. CUDA is optional:
+
+```
+cargo build                 # CPU only, no CUDA toolkit needed
+cargo test                  # CPU test suite
+```
+
+The CUDA backend is behind a feature flag and is excluded from the default
+workspace members, so a machine without a CUDA toolkit builds and tests the whole
+project. To include it:
+
+```
+cargo build --features vearo/cuda
+cargo test --workspace --features vearo/cuda
+```
+
+Tests that exist to check CUDA specifically, such as CPU/GPU parity, are compiled
+out without the feature rather than failing. Code that just wants a device can ask
+at runtime instead of using `cfg`:
+
+```rust
+let device = if vearo::cuda_available() { Device::Cuda(0) } else { Device::Cpu };
+```
 
 Kernels ship as prebuilt PTX, so `nvcc` is only needed if you change `kernels.cu`:
 

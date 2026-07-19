@@ -12,9 +12,15 @@ workspace = true
 vearo-core.workspace = true
 vearo-autograd.workspace = true
 vearo-backend-cpu.workspace = true
-vearo-backend-cuda.workspace = true
+vearo-backend-cuda = { workspace = true, optional = true }
 vearo-nn.workspace = true
 vearo-optim.workspace = true
+
+[features]
+default = []
+# Compiles and registers the CUDA backend. Requires a CUDA toolkit; without it
+# Vearo runs CPU-only and Device::Cuda is unavailable.
+cuda = ["dep:vearo-backend-cuda"]
 
 [dev-dependencies]
 serde.workspace = true

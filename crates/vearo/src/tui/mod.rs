@@ -776,6 +776,10 @@ fn pad_visible(s: &str, w: usize) -> String {
 }
 
 /// Peak CUDA memory in MiB, if the CUDA backend is active.
+///
+/// A CPU-only build has no VRAM to report, so the dashboard shows a dash rather
+/// than a misleading zero.
+#[cfg(feature = "cuda")]
 fn peak_vram_mb() -> Option<usize> {
     let bytes = crate::backend_cuda::get_peak_memory();
     if bytes == 0 {
@@ -783,6 +787,12 @@ fn peak_vram_mb() -> Option<usize> {
     } else {
         Some(bytes / (1024 * 1024))
     }
+}
+
+/// Peak CUDA memory in MiB. Always `None` without the `cuda` feature.
+#[cfg(not(feature = "cuda"))]
+const fn peak_vram_mb() -> Option<usize> {
+    None
 }
 
 /// Resident set size of this process, in GB.

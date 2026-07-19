@@ -329,7 +329,13 @@ impl StyleCnn {
 #[ignore = "run programmatic sweep over hyperparameters for tabular model; cargo test --release --test train_cnn test_sweep_tabular -- --ignored --nocapture"]
 fn test_sweep_tabular() {
     vearo::init();
-    let device = Device::Cuda(0);
+    // CPU-only builds have no CUDA backend registered; run there instead of
+    // dispatching to a device that cannot execute.
+    let device = if vearo::cuda_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
 
     let x_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_train.bin"));
     let y_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_y_train.bin"));
@@ -419,7 +425,13 @@ fn test_sweep_tabular() {
 #[ignore = "run only the tabular regression model; cargo test --release --test train_cnn test_train_tabular_only -- --ignored --nocapture"]
 fn test_train_tabular_only() {
     vearo::init();
-    let device = Device::Cuda(0);
+    // CPU-only builds have no CUDA backend registered; run there instead of
+    // dispatching to a device that cannot execute.
+    let device = if vearo::cuda_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
 
     println!("=== Training Tabular Regression Model ===");
     let x_train_tab = load_bin_f32_host(&get_kaggle_path("preprocessed/tabular_X_train.bin"));
@@ -534,7 +546,13 @@ fn test_train_tabular_only() {
 #[ignore = "long training run needing datasets; run scripts/setup_data.sh then: cargo test --release --test train_cnn -- --ignored --nocapture"]
 fn test_train_cnn_full() {
     vearo::init();
-    let device = Device::Cuda(0);
+    // CPU-only builds have no CUDA backend registered; run there instead of
+    // dispatching to a device that cannot execute.
+    let device = if vearo::cuda_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
     let s = img_size();
 
     // ----------------- 1. Train Tabular Regression Model -----------------
@@ -804,8 +822,15 @@ fn test_train_cnn_full() {
         let val_acc = correct as f32 / val_size as f32;
         let val_loss = val_loss_sum / val_batches as f32;
 
-        let slots_len = vearo::backend_cuda::CUDA_SLOTS.lock().unwrap().len();
-        let free_len = vearo::backend_cuda::FREE_CUDA_SLOTS.lock().unwrap().len();
+        // Live device slots, for the leak watch in the dashboard. Zero on a
+        // CPU-only build, which holds no device slots at all.
+        #[cfg(feature = "cuda")]
+        let (slots_len, free_len) = (
+            vearo::backend_cuda::CUDA_SLOTS.lock().unwrap().len(),
+            vearo::backend_cuda::FREE_CUDA_SLOTS.lock().unwrap().len(),
+        );
+        #[cfg(not(feature = "cuda"))]
+        let (slots_len, free_len) = (0usize, 0usize);
         ui.update(
             epoch + 1,
             epoch_loss / batches as f32,
@@ -875,9 +900,12 @@ fn test_train_cnn_full() {
     );
     println!("CNN Peak Validation Accuracy: {:.2}%", best_val_acc * 100.0);
 
-    let peak_vram = vearo::backend_cuda::get_peak_memory();
-    println!(
-        "PEAK CUDA VRAM ALLOCATED: {:.3} MB",
-        peak_vram as f64 / 1024.0 / 1024.0
-    );
+    #[cfg(feature = "cuda")]
+    {
+        let peak_vram = vearo::backend_cuda::get_peak_memory();
+        println!(
+            "PEAK CUDA VRAM ALLOCATED: {:.3} MB",
+            peak_vram as f64 / 1024.0 / 1024.0
+        );
+    }
 }

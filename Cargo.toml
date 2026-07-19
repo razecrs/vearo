@@ -1,6 +1,17 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# A bare `cargo build` or `cargo test` skips the CUDA backend, so the project
+# builds and its CPU tests run on a machine with no CUDA toolkit installed.
+# Use `--workspace` (or `-p vearo-backend-cuda`) to include it.
+default-members = [
+    "crates/vearo-core",
+    "crates/vearo-autograd",
+    "crates/vearo-backend-cpu",
+    "crates/vearo-nn",
+    "crates/vearo-optim",
+    "crates/vearo",
+]
 
 [workspace.package]
 version = "0.0.1"

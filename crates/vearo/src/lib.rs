@@ -6,7 +6,8 @@
 pub use vearo_autograd as autograd;
 /// CPU execution backend.
 pub use vearo_backend_cpu as backend_cpu;
-/// CUDA execution backend.
+/// CUDA execution backend. Present only with the `cuda` feature.
+#[cfg(feature = "cuda")]
 pub use vearo_backend_cuda as backend_cuda;
 /// Core vocabulary and types.
 pub use vearo_core as core;
@@ -30,13 +31,27 @@ pub use vearo_core::{is_recomputing, next_rng_counter, rng_counter, set_recomput
 /// Activation checkpointing.
 pub use vearo_autograd::checkpoint;
 
-/// Initializes the backend and autograd engine. Registers both CPU and CUDA backends.
+/// Initializes the backends and the autograd engine.
+///
+/// Registers the CPU backend always, and the CUDA backend when the `cuda`
+/// feature is enabled. Without that feature Vearo is CPU-only and
+/// `Device::Cuda` has no registered backend, so dispatching to it fails rather
+/// than silently computing on the wrong device.
 ///
 /// Idempotent - safe to call more than once.
 pub fn init() {
     vearo_backend_cpu::init();
+    #[cfg(feature = "cuda")]
     vearo_backend_cuda::init();
     vearo_autograd::init();
+}
+
+/// Returns whether this build has the CUDA backend compiled in.
+///
+/// Lets a caller pick a device at runtime without a `cfg` of its own.
+#[must_use]
+pub const fn cuda_available() -> bool {
+    cfg!(feature = "cuda")
 }
 
 #[cfg(test)]

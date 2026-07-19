@@ -126,7 +126,13 @@ impl ImageMlp {
 #[ignore = "requires datasets; run scripts/setup_data.sh then: cargo test --release --test generate_submissions -- --ignored"]
 fn test_generate_submissions() {
     vearo::init();
-    let device = Device::Cuda(0);
+    // CPU-only builds have no CUDA backend registered; run there instead of
+    // dispatching to a device that cannot execute.
+    let device = if vearo::cuda_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
 
     // ----------------- 1. Train Tabular Regression Model & Generate Submission -----------------
     println!("Training Tabular Regression Model on GPU...");

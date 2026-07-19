@@ -8,6 +8,10 @@
     clippy::doc_markdown
 )]
 
+// This file exercises the CUDA backend directly, so it only builds with the
+// `cuda` feature. CPU coverage of the same ops lives in the other test files.
+#![cfg(feature = "cuda")]
+
 use vearo::nn::{BatchNorm2d, Module};
 use vearo::{Device, Tensor};
 

@@ -40,8 +40,8 @@ pub fn init() {
             embedding_backward,
             cross_entropy,
             cross_entropy_backward,
-            conv2d,
-            conv2d_backward,
+            conv2d: dispatch_conv2d,
+            conv2d_backward: dispatch_conv2d_backward,
             maxpool2d,
             maxpool2d_backward,
             avgpool2d,
@@ -1258,6 +1258,204 @@ pub fn conv2d_fast(
 
     write_f32(&out, out_data);
     out
+}
+
+
+/// Backward for [`conv2d_fast`]: `im2col` plus two GEMMs, then `col2im`.
+///
+/// Mirrors the forward lowering. With `cols` the im2col matrix and `go` the
+/// output gradient laid out `[cout, spatial]`:
+///
+/// - `grad_weight = go @ cols^T`, accumulated across the batch
+/// - `grad_cols   = W^T @ go`, then scattered back by `col2im`
+/// - `grad_bias`  is a plain row sum of `go`
+///
+/// Like the forward path this reassociates the sums, so it agrees with
+/// [`conv2d_backward`] to a tolerance rather than exactly. Use
+/// [`conv2d_backward`] where bit-equality with CUDA matters.
+///
+/// # Panics
+/// Panics if dtypes are not F32 or shapes disagree.
+#[must_use]
+// Strides are tensor dimensions, far below isize::MAX.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
+pub fn conv2d_backward_fast(
+    input: &Tensor,
+    weight: &Tensor,
+    grad_out: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> (Tensor, Tensor, Tensor) {
+    let ic = input.contiguous();
+    let wc = weight.contiguous();
+    let gc = grad_out.contiguous();
+    let id = ic.shape().dims();
+    let wd = wc.shape().dims();
+    let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
+    let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
+    let gd = gc.shape().dims();
+    let (oh, ow) = (gd[2], gd[3]);
+
+    let x = read_f32(&ic);
+    let wt = read_f32(&wc);
+    let go = read_f32(&gc);
+
+    let patch = cin * kh * kw;
+    let spatial = oh * ow;
+
+    let mut gi = vec![0.0f32; ic.shape().numel()];
+    let mut gw = vec![0.0f32; wc.shape().numel()];
+    let mut gb = vec![0.0f32; cout];
+
+    let mut cols = vec![0.0f32; patch * spatial];
+    let mut gcols = vec![0.0f32; patch * spatial];
+
+    for nn in 0..n {
+        let go_img = &go[nn * cout * spatial..(nn + 1) * cout * spatial];
+
+        // grad_bias: row sums of the output gradient.
+        for (co, slot) in gb.iter_mut().enumerate() {
+            let base = co * spatial;
+            let mut acc = 0.0f32;
+            for s in 0..spatial {
+                acc += go_img[base + s];
+            }
+            *slot += acc;
+        }
+
+        // im2col of this image, same layout the forward path builds.
+        for c in 0..cin {
+            for i in 0..kh {
+                for j in 0..kw {
+                    let row_off = ((c * kh + i) * kw + j) * spatial;
+                    for y in 0..oh {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let src_row = ((nn * cin + c) * h + (ih - padding)) * w;
+                        let dst_row = row_off + y * ow;
+                        for x_out in 0..ow {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            cols[dst_row + x_out] = x[src_row + (iw - padding)];
+                        }
+                    }
+                }
+            }
+        }
+
+        // grad_weight += go [cout, spatial] x cols^T [spatial, patch].
+        // cols is [patch, spatial] row-major, so its transpose is the same
+        // buffer read with the strides swapped.
+        unsafe {
+            gemm::gemm(
+                cout, patch, spatial,
+                gw.as_mut_ptr(), 1, patch as isize,
+                true,
+                go_img.as_ptr(), 1, spatial as isize,
+                cols.as_ptr(), spatial as isize, 1,
+                1.0f32, 1.0f32,
+                false, false, false,
+                gemm::Parallelism::Rayon(0),
+            );
+        }
+
+        // grad_cols = W^T [patch, cout] x go [cout, spatial]. W is
+        // [cout, patch] row-major, so again the transpose is a stride swap.
+        unsafe {
+            gemm::gemm(
+                patch, spatial, cout,
+                gcols.as_mut_ptr(), 1, spatial as isize,
+                false,
+                wt.as_ptr(), patch as isize, 1,
+                go_img.as_ptr(), 1, spatial as isize,
+                0.0f32, 1.0f32,
+                false, false, false,
+                gemm::Parallelism::Rayon(0),
+            );
+        }
+
+        // col2im: scatter the column gradients back. Overlapping windows
+        // accumulate, which is what makes this a scatter rather than a copy.
+        for c in 0..cin {
+            for i in 0..kh {
+                for j in 0..kw {
+                    let row_off = ((c * kh + i) * kw + j) * spatial;
+                    for y in 0..oh {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let dst_row = ((nn * cin + c) * h + (ih - padding)) * w;
+                        let src_row = row_off + y * ow;
+                        for x_out in 0..ow {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            gi[dst_row + (iw - padding)] += gcols[src_row + x_out];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        Tensor::from_f32(&gi, *ic.shape()),
+        Tensor::from_f32(&gw, *wc.shape()),
+        Tensor::from_f32(&gb, [cout]),
+    )
+}
+
+/// Selects the convolution implementation for registered dispatch.
+///
+/// Defaults to the bit-exact reference. Setting `VEARO_FAST_CONV=1` switches to
+/// the GEMM-lowered path, which is much faster on wide layers but reassociates
+/// the sum, so it is opt-in rather than the default: every CPU/CUDA parity test
+/// in the suite depends on the reference being what runs.
+fn use_fast_conv() -> bool {
+    use std::sync::OnceLock;
+    static FAST: OnceLock<bool> = OnceLock::new();
+    *FAST.get_or_init(|| std::env::var("VEARO_FAST_CONV").is_ok_and(|v| v != "0" && v != "false"))
+}
+
+/// Backward counterpart of [`dispatch_conv2d`], selected by the same flag so
+/// forward and backward never disagree about which lowering is in use.
+fn dispatch_conv2d_backward(
+    input: &Tensor,
+    weight: &Tensor,
+    grad_out: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> (Tensor, Tensor, Tensor) {
+    if use_fast_conv() {
+        conv2d_backward_fast(input, weight, grad_out, stride, padding)
+    } else {
+        conv2d_backward(input, weight, grad_out, stride, padding)
+    }
+}
+
+fn dispatch_conv2d(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    if use_fast_conv() {
+        conv2d_fast(input, weight, bias, stride, padding)
+    } else {
+        conv2d(input, weight, bias, stride, padding)
+    }
 }
 
 /// 2D convolution on CPU (optimized direct with padded input).

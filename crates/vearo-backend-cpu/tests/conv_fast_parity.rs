@@ -12,9 +12,10 @@
 #![allow(
     clippy::many_single_char_names,
     clippy::cast_precision_loss,
-    clippy::suboptimal_flops
+    clippy::suboptimal_flops,
+    clippy::similar_names
 )]
-use vearo_backend_cpu::{conv2d, conv2d_fast};
+use vearo_backend_cpu::{conv2d, conv2d_backward, conv2d_backward_fast, conv2d_fast};
 use vearo_core::{DType, Device, Shape, Tensor};
 
 /// Deterministic values with enough variation that cancellation would show.
@@ -97,4 +98,51 @@ fn fast_conv_rejects_non_f32() {
     let w = filled([1, 1, 3, 3], 0.0);
     let b = Tensor::from_f32(&[0.0], [1]).to(Device::Cpu);
     let _ = conv2d_fast(&x, &w, &b, 1, 0);
+}
+
+/// The backward lowering must agree with the reference on all three gradients.
+fn check_backward(n: usize, cin: usize, cout: usize, side: usize, k: usize, stride: usize, padding: usize) {
+    vearo_backend_cpu::init();
+
+    let x = filled([n, cin, side, side], 0.0);
+    let w = filled([cout, cin, k, k], 1.7);
+    let b = Tensor::from_f32(&vec![0.0f32; cout], [cout]).to(Device::Cpu);
+
+    let out = conv2d(&x, &w, &b, stride, padding);
+    let od = out.shape().dims().to_vec();
+    let g = filled([od[0], od[1], od[2], od[3]], 0.9);
+
+    let (gi_r, gw_r, gb_r) = conv2d_backward(&x, &w, &g, stride, padding);
+    let (gi_f, gw_f, gb_f) = conv2d_backward_fast(&x, &w, &g, stride, padding);
+
+    for (name, r, f) in [
+        ("grad_input", gi_r.to_vec_f32(), gi_f.to_vec_f32()),
+        ("grad_weight", gw_r.to_vec_f32(), gw_f.to_vec_f32()),
+        ("grad_bias", gb_r.to_vec_f32(), gb_f.to_vec_f32()),
+    ] {
+        assert_eq!(r.len(), f.len(), "{name}: length mismatch");
+        let magnitude = r.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(magnitude > 1e-4, "{name} is degenerate (max {magnitude})");
+        let worst = r
+            .iter()
+            .zip(f.iter())
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let rel = worst / magnitude;
+        println!("  {name:<12} max {magnitude:.4} rel {rel:e}");
+        assert!(
+            rel < 1e-5,
+            "{name} disagrees by {rel:e} relative for n{n} cin{cin} cout{cout} \
+             {side}x{side} k{k} s{stride} p{padding}"
+        );
+    }
+}
+
+#[test]
+fn fast_conv_backward_matches_reference() {
+    println!("n2 cin3 cout8 8x8 k3 s1 p1:");
+    check_backward(2, 3, 8, 8, 3, 1, 1);
+    println!("n1 cin2 cout4 7x7 k3 s2 p0:");
+    check_backward(1, 2, 4, 7, 3, 2, 0);
+    println!("n2 cin5 cout7 9x9 k3 s1 p1:");
+    check_backward(2, 5, 7, 9, 3, 1, 1);
 }

@@ -1072,34 +1072,56 @@ pub fn conv2d(
     let b = read_f32(&bc);
     let mut out_data = vec![0.0f32; out_shape.numel()];
 
-    for nn in 0..n {
-        for co in 0..cout {
-            for y in 0..oh {
-                for x_out in 0..ow {
-                    let mut acc = b[co];
-                    for c in 0..cin {
-                        for i in 0..kh {
-                            let ih = y * stride + i;
-                            if ih < padding || ih >= h + padding {
-                                continue;
-                            }
-                            let ih = ih - padding;
-                            for j in 0..kw {
-                                let iw = x_out * stride + j;
-                                if iw < padding || iw >= w + padding {
-                                    continue;
-                                }
-                                let iw = iw - padding;
-                                let x_idx = ((nn * cin + c) * h + ih) * w + iw;
-                                let w_idx = ((co * cin + c) * kh + i) * kw + j;
-                                acc = x[x_idx].mul_add(wt[w_idx], acc);
-                            }
-                        }
+    // Output elements are independent, so the (n, cout, oh, ow) space is split
+    // across threads. The inner reduction over (c, i, j) keeps its exact order
+    // and its accumulator chain, so results stay bit-identical to the serial
+    // version and to the CUDA kernel, which was written to match this order.
+    let per_image = cout * oh * ow;
+    let total = n * per_image;
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let chunk = total.div_ceil(threads.max(1));
+
+    let compute = |out_chunk: &mut [f32], start: usize| {
+        for (k, slot) in out_chunk.iter_mut().enumerate() {
+            let o = start + k;
+            let x_out = o % ow;
+            let y = (o / ow) % oh;
+            let co = (o / (ow * oh)) % cout;
+            let nn = o / per_image;
+
+            // Valid tap ranges, hoisted out of the reduction. A skipped tap
+            // added nothing to the accumulator, so restricting the loop to
+            // valid taps produces the identical sequence of operations.
+            let i_lo = padding.saturating_sub(y * stride);
+            let i_hi = kh.min((h + padding).saturating_sub(y * stride));
+            let j_lo = padding.saturating_sub(x_out * stride);
+            let j_hi = kw.min((w + padding).saturating_sub(x_out * stride));
+
+            let mut acc = b[co];
+            for c in 0..cin {
+                for i in i_lo..i_hi {
+                    let ih = y * stride + i - padding;
+                    let x_row = ((nn * cin + c) * h + ih) * w;
+                    let w_row = ((co * cin + c) * kh + i) * kw;
+                    for j in j_lo..j_hi {
+                        let iw = x_out * stride + j - padding;
+                        acc = x[x_row + iw].mul_add(wt[w_row + j], acc);
                     }
-                    out_data[((nn * cout + co) * oh + y) * ow + x_out] = acc;
                 }
             }
+            *slot = acc;
         }
+    };
+
+    if threads <= 1 || total < 4096 {
+        compute(&mut out_data, 0);
+    } else {
+        std::thread::scope(|s| {
+            for (t, out_chunk) in out_data.chunks_mut(chunk).enumerate() {
+                let compute = &compute;
+                s.spawn(move || compute(out_chunk, t * chunk));
+            }
+        });
     }
 
     write_f32(&out, out_data);

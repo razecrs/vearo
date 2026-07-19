@@ -31,7 +31,7 @@ fn main() {
         let x1 = rng.next_uniform(-1.0, 1.0);
         xs.push(x0);
         xs.push(x1);
-        ys.push((3.0 * x0).sin() + 0.5 * x1 * x1);
+        ys.push(0.5f32.mul_add(x1 * x1, (3.0 * x0).sin()));
     }
     let x = Tensor::from_f32(&xs, [N, IN]).to(Device::Cpu);
     let y = Tensor::from_f32(&ys, [N, 1]).to(Device::Cpu);

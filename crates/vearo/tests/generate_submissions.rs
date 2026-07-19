@@ -19,7 +19,7 @@ use vearo::nn::Module;
 use vearo::{Device, Tensor};
 
 
-/// Resolves a dataset path: $VEARO_DATA_DIR, then <repo>/data/kaggle, then legacy
+/// Resolves a dataset path: `$VEARO_DATA_DIR`, then `<repo>/data/kaggle`, then legacy
 /// developer locations. Populate it with `scripts/setup_data.sh`.
 fn data_path(suffix: &str) -> String {
     if let Ok(dir) = std::env::var("VEARO_DATA_DIR") {
@@ -234,7 +234,7 @@ fn test_generate_submissions() {
     let img_preds = mlp_img.forward(&x_test_t).to(Device::Cpu).to_vec_f32();
 
     // Read the test image names from sample_submission.csv
-    let sample_sub_content = std::fs::read_to_string(&data_path("scene_style/sample_submission.csv")).unwrap();
+    let sample_sub_content = std::fs::read_to_string(data_path("scene_style/sample_submission.csv")).unwrap();
     let image_names: Vec<String> = sample_sub_content
         .lines()
         .skip(1)

@@ -347,9 +347,19 @@ fn test_train_cnn_full() {
     let mut rng_seed = 42u64;
 
     let mut best_val_acc = -1.0f32;
+    // Live dashboard in a terminal; plain one-line-per-epoch when piped to a log.
+    // Also stream to JSONL so `vearo-watch` can follow the run live, including
+    // when it is running headless on a remote box under nohup.
+    let metrics_path =
+        std::env::var("VEARO_METRICS").unwrap_or_else(|_| "runs/style_cnn.jsonl".to_string());
+    if let Some(dir) = std::path::Path::new(&metrics_path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut ui = vearo::tui::TrainingMonitor::new("style cnn", &format!("{device:?}"), 75)
+        .with_metrics(&metrics_path);
 
     let start_cnn = Instant::now();
-    for epoch in 0..35 {
+    for epoch in 0..75 {
         // Learning Rate Decay Schedule: reduce LR by 0.5 every 10 epochs
         if epoch > 0 && epoch % 10 == 0 {
             current_lr *= 0.5;
@@ -433,19 +443,21 @@ fn test_train_cnn_full() {
 
         let slots_len = vearo::backend_cuda::CUDA_SLOTS.lock().unwrap().len();
         let free_len = vearo::backend_cuda::FREE_CUDA_SLOTS.lock().unwrap().len();
-        println!(
-            "CNN Epoch {:02} | Train Loss: {:.6} | Val Loss: {:.6} | Val Acc: {:.2}% | CUDA Active Slots: {}",
+        ui.update(
             epoch + 1,
             epoch_loss / batches as f32,
-            val_loss,
-            val_acc * 100.0,
-            slots_len - free_len
+            Some(val_loss),
+            Some(val_acc),
         );
+        let _ = slots_len - free_len;
 
         // Fail-safe Best Checkpoint Selection: Run test inference and *immediately* write it to disk.
         if val_acc > best_val_acc {
             best_val_acc = val_acc;
-            println!("   --> New best validation accuracy: {:.2}%! Running test inference & saving...", val_acc * 100.0);
+            ui.set_note(&format!(
+                "new best val acc {:.2}% - running test inference and saving submission",
+                val_acc * 100.0
+            ));
             
             let test_size = 5482;
             let test_batch_size = 256;
@@ -484,6 +496,7 @@ fn test_train_cnn_full() {
             println!("   --> Saved peak performance submission to disk!");
         }
     }
+    ui.finish();
     println!("CNN Training completed in {:.4} seconds.", start_cnn.elapsed().as_secs_f64());
     println!("CNN Peak Validation Accuracy: {:.2}%", best_val_acc * 100.0);
 

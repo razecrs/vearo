@@ -15,6 +15,10 @@ pub use vearo_nn as nn;
 /// Optimizer implementations.
 pub use vearo_optim as optim;
 
+/// Terminal dashboard for training runs.
+pub mod metrics;
+pub mod tui;
+
 // Hoisted primitives for convenience.
 pub use vearo_core::{DType, Device, Shape, Tensor};
 /// Training vs evaluation mode control (affects layers like dropout).

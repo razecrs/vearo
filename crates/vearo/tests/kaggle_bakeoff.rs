@@ -13,7 +13,7 @@ use vearo::nn::Module;
 use vearo::{Device, Tensor};
 
 
-/// Resolves a dataset path: $VEARO_DATA_DIR, then <repo>/data/kaggle, then legacy
+/// Resolves a dataset path: `$VEARO_DATA_DIR`, then `<repo>/data/kaggle`, then legacy
 /// developer locations. Populate it with `scripts/setup_data.sh`.
 fn data_path(suffix: &str) -> String {
     if let Ok(dir) = std::env::var("VEARO_DATA_DIR") {

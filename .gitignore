@@ -15,6 +15,13 @@ Cargo.lock.orig
 # local planning notes 
 /ROADMAP.md
 
+# vearo-watch (node build output and deps)
+tools/vearo-watch/node_modules/
+tools/vearo-watch/dist/
+
+# metrics streams from training runs
+*.jsonl
+
 # editors
 .idea/
 .vscode/

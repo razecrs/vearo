@@ -30,7 +30,8 @@ pub struct CudaSlot {
 
 pub static CUDA_SLOTS: LazyLock<Mutex<Vec<Option<CudaSlot>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
-pub static FREE_CUDA_SLOTS: LazyLock<Mutex<Vec<u32>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+pub static FREE_CUDA_SLOTS: LazyLock<Mutex<Vec<(usize, u32)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 pub static PEAK_CUDA_MEM_BYTES: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
 
 pub fn get_peak_memory() -> usize {
@@ -39,42 +40,73 @@ pub fn get_peak_memory() -> usize {
 
 pub fn cuda_alloc(numel: usize) -> StorageId {
     let dev = get_cuda_device();
-    let slice = dev
-        .alloc_zeros::<f32>(numel)
-        .expect("Failed to allocate CUDA memory");
 
     let mut slots = CUDA_SLOTS.lock().unwrap();
     let mut free = FREE_CUDA_SLOTS.lock().unwrap();
 
-    // Calculate current total memory allocated
-    let mut current_total = 0;
-    for s in slots.iter().flatten() {
-        current_total += s.slice.len() * 4;
-    }
-    current_total += numel * 4;
-
-    let mut peak = PEAK_CUDA_MEM_BYTES.lock().unwrap();
-    if current_total > *peak {
-        *peak = current_total;
+    let mut found_idx = None;
+    for (i, &(size, slot_idx)) in free.iter().enumerate() {
+        if size == numel {
+            found_idx = Some((i, slot_idx));
+            break;
+        }
     }
 
-    let slot = CudaSlot {
-        slice,
-        ref_count: 1,
-    };
+    if let Some((free_list_idx, slot_idx)) = found_idx {
+        free.swap_remove(free_list_idx);
+        let slot = slots[slot_idx as usize].as_mut().unwrap();
+        slot.ref_count = 1;
 
-    if let Some(idx) = free.pop() {
-        slots[idx as usize] = Some(slot);
+        // Zero out the reused slice asynchronously on the current stream.
+        dev.memset_zeros(&mut slot.slice)
+            .expect("Failed to zero reused CUDA memory");
+
         StorageId {
             shard_idx: 0,
-            slot_idx: idx,
+            slot_idx,
         }
     } else {
-        let idx = slots.len() as u32;
-        slots.push(Some(slot));
-        StorageId {
-            shard_idx: 0,
-            slot_idx: idx,
+        let slice = dev
+            .alloc_zeros::<f32>(numel)
+            .expect("Failed to allocate CUDA memory");
+
+        let mut current_total = 0;
+        for s in slots.iter().flatten() {
+            current_total += s.slice.len() * 4;
+        }
+        current_total += numel * 4;
+
+        let mut peak = PEAK_CUDA_MEM_BYTES.lock().unwrap();
+        if current_total > *peak {
+            *peak = current_total;
+        }
+
+        let slot = CudaSlot {
+            slice,
+            ref_count: 1,
+        };
+
+        let mut empty_idx = None;
+        for (idx, s) in slots.iter().enumerate() {
+            if s.is_none() {
+                empty_idx = Some(idx as u32);
+                break;
+            }
+        }
+
+        if let Some(idx) = empty_idx {
+            slots[idx as usize] = Some(slot);
+            StorageId {
+                shard_idx: 0,
+                slot_idx: idx,
+            }
+        } else {
+            let idx = slots.len() as u32;
+            slots.push(Some(slot));
+            StorageId {
+                shard_idx: 0,
+                slot_idx: idx,
+            }
         }
     }
 }
@@ -112,16 +144,17 @@ pub fn cuda_refcount_dec(storage_id: StorageId, device: Device) -> bool {
     if device.is_cuda() {
         let mut slots = CUDA_SLOTS.lock().unwrap();
         let mut free = false;
+        let mut size = 0;
         if let Some(ref mut slot) = slots[storage_id.slot_idx as usize] {
             assert!(slot.ref_count > 0, "Reference count underflow");
             slot.ref_count -= 1;
             if slot.ref_count == 0 {
                 free = true;
+                size = slot.slice.len();
             }
         }
         if free {
-            slots[storage_id.slot_idx as usize] = None;
-            FREE_CUDA_SLOTS.lock().unwrap().push(storage_id.slot_idx);
+            FREE_CUDA_SLOTS.lock().unwrap().push((size, storage_id.slot_idx));
         }
         free
     } else {

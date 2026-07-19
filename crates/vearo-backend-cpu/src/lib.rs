@@ -1,4 +1,7 @@
 //! CPU reference backend implementations.
+// FFI into the hand-written assembly microkernels in src/asm.
+#![allow(unsafe_code)]
+
 #![allow(
     clippy::suboptimal_flops,
     clippy::cast_precision_loss,
@@ -234,11 +237,32 @@ pub fn div(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     elementwise_op(lhs, rhs, |a, b| a / b)
 }
 
+#[cfg(vearo_cpu_asm)]
+unsafe extern "C" {
+    fn matmul_block_4x8_avx2_asm(
+        out_ptr: *mut f32,
+        lhs_ptr: *const f32,
+        rhs_ptr: *const f32,
+        k_l: usize,
+        n: usize,
+    );
+}
+
 /// Matrix multiplication of two CPU tensors.
 ///
 /// # Panics
 /// Panics if ranks are less than 2, trailing dimensions do not match, or dtypes are not F32.
 #[must_use]
+// Scoped to this function while the assembly path is in progress. The shared
+// prefix between the asm and portable branches wants hoisting once the two
+// settle, and the indexed loop wants an iterator; neither is a correctness
+// issue. Do not widen these to the crate.
+#[allow(
+    clippy::too_many_lines,
+    clippy::if_same_then_else,
+    clippy::branches_sharing_code,
+    clippy::needless_range_loop
+)]
 pub fn matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     assert_eq!(lhs.dtype(), vearo_core::DType::F32, "Only F32 supported");
     assert_eq!(rhs.dtype(), vearo_core::DType::F32, "Only F32 supported");
@@ -270,47 +294,122 @@ pub fn matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         return out_tensor;
     }
 
-    // Copy operands out (each under its own brief lock), then compute unlocked.
-    let lhs_data = read_f32(lhs);
-    let rhs_data = read_f32(rhs);
+    let lhs_contig = lhs.contiguous();
+    let rhs_contig = rhs.contiguous();
+    let lhs_data = read_f32(&lhs_contig);
+    let rhs_data = read_f32(&rhs_contig);
     let mut out_data = vec![0.0f32; out_shape.numel()];
 
-    // Strides / batch metadata are loop-invariant - compute them once.
-    let l_stride_m = lhs.strides()[rank_l - 2];
-    let l_stride_k = lhs.strides()[rank_l - 1];
-    let r_stride_k = rhs.strides()[rank_r - 2];
-    let r_stride_n = rhs.strides()[rank_r - 1];
-    let out_stride_m = out_tensor.strides()[out_tensor.strides().rank() - 2];
-    let out_stride_n = out_tensor.strides()[out_tensor.strides().rank() - 1];
-    let batch_strides_l = Shape::new(&lhs.strides().dims()[..rank_l - 2]);
-    let batch_strides_r = Shape::new(&rhs.strides().dims()[..rank_r - 2]);
-    let out_batch_dims = Shape::new(&out_shape.dims()[..out_shape.rank() - 2]);
-    let out_batch_strides =
-        Shape::new(&out_tensor.strides().dims()[..out_tensor.strides().rank() - 2]);
+    let l_stride_m = lhs_contig.strides()[rank_l - 2];
+    let l_stride_k = lhs_contig.strides()[rank_l - 1];
+    let r_stride_k = rhs_contig.strides()[rank_r - 2];
+    let r_stride_n = rhs_contig.strides()[rank_r - 1];
+    let batch_strides_l = Shape::new(&lhs_contig.strides().dims()[..rank_l - 2]);
+    let batch_strides_r = Shape::new(&rhs_contig.strides().dims()[..rank_r - 2]);
 
-    let mut iter = NdIterator::new(out_batch_shape);
-    loop {
-        let batch_coord = iter.coord();
-        let batch_offset_l = get_offset(batch_coord, &batch_shape_l, &batch_strides_l);
-        let batch_offset_r = get_offset(batch_coord, &batch_shape_r, &batch_strides_r);
-        let batch_offset_out = get_offset(batch_coord, &out_batch_dims, &out_batch_strides);
+    let total_rows = out_batch_shape.numel() * m;
+    let compute = |out_data_slice: &mut [f32], start_row: usize| {
+        let end_row = start_row + out_data_slice.len() / n;
+        let mut row_idx = start_row;
+        while row_idx < end_row {
+            let r_m = row_idx % m;
+            let batch_idx = row_idx / m;
 
-        for r_m in 0..m {
-            for r_n in 0..n {
-                let mut sum = 0.0;
+            let mut run_asm = false;
+            #[cfg(vearo_cpu_asm)]
+            {
+                // A full 4-row block must be available, and the CPU must
+                // actually have the instructions the kernel is written in.
+                if r_m + 4 <= m
+                    && row_idx + 4 <= end_row
+                    && is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("fma")
+                {
+                    run_asm = true;
+                }
+            }
+
+            if run_asm {
+                let mut batch_coord = [0usize; 8];
+                let mut remaining = batch_idx;
+                for i in (0..out_batch_shape.rank()).rev() {
+                    batch_coord[i] = remaining % out_batch_shape[i];
+                    remaining /= out_batch_shape[i];
+                }
+
+                let batch_coord_slice = &batch_coord[..out_batch_shape.rank()];
+                let batch_offset_l = get_offset(batch_coord_slice, &batch_shape_l, &batch_strides_l);
+                let batch_offset_r = get_offset(batch_coord_slice, &batch_shape_r, &batch_strides_r);
+
+                let n_blocks = n / 8;
+                for b_idx in 0..n_blocks {
+                    let c_n = b_idx * 8;
+                    let out_ptr = unsafe { out_data_slice.as_mut_ptr().add((row_idx - start_row) * n + c_n) };
+                    let lhs_ptr = unsafe { lhs_data.as_ptr().add(batch_offset_l + r_m * k_l) };
+                    let rhs_ptr = unsafe { rhs_data.as_ptr().add(batch_offset_r + c_n) };
+
+                    #[cfg(vearo_cpu_asm)]
+                    unsafe {
+                        matmul_block_4x8_avx2_asm(out_ptr, lhs_ptr, rhs_ptr, k_l, n);
+                    }
+                }
+
+                for c_n in (n_blocks * 8)..n {
+                    for r_offset in 0..4 {
+                        let mut sum = 0.0f32;
+                        let curr_r_m = r_m + r_offset;
+                        for r_k in 0..k_l {
+                            let l_idx = batch_offset_l + curr_r_m * l_stride_m + r_k * l_stride_k;
+                            let r_idx = batch_offset_r + r_k * r_stride_k + c_n * r_stride_n;
+                            sum = lhs_data[l_idx].mul_add(rhs_data[r_idx], sum);
+                        }
+                        out_data_slice[(row_idx + r_offset - start_row) * n + c_n] = sum;
+                    }
+                }
+
+                row_idx += 4;
+            } else {
+                let mut batch_coord = [0usize; 8];
+                let mut remaining = batch_idx;
+                for i in (0..out_batch_shape.rank()).rev() {
+                    batch_coord[i] = remaining % out_batch_shape[i];
+                    remaining /= out_batch_shape[i];
+                }
+
+                let batch_coord_slice = &batch_coord[..out_batch_shape.rank()];
+                let batch_offset_l = get_offset(batch_coord_slice, &batch_shape_l, &batch_strides_l);
+                let batch_offset_r = get_offset(batch_coord_slice, &batch_shape_r, &batch_strides_r);
+
+                let row_slice = &mut out_data_slice[(row_idx - start_row) * n..(row_idx - start_row + 1) * n];
                 for r_k in 0..k_l {
                     let l_idx = batch_offset_l + r_m * l_stride_m + r_k * l_stride_k;
-                    let r_idx = batch_offset_r + r_k * r_stride_k + r_n * r_stride_n;
-                    sum = lhs_data[l_idx].mul_add(rhs_data[r_idx], sum);
+                    let lhs_val = lhs_data[l_idx];
+
+                    let r_k_offset = batch_offset_r + r_k * r_stride_k;
+                    for r_n in 0..n {
+                        let r_idx = r_k_offset + r_n * r_stride_n;
+                        row_slice[r_n] = lhs_val.mul_add(rhs_data[r_idx], row_slice[r_n]);
+                    }
                 }
-                let out_idx = batch_offset_out + r_m * out_stride_m + r_n * out_stride_n;
-                out_data[out_idx] = sum;
+
+                row_idx += 1;
             }
         }
+    };
 
-        if !iter.step() {
-            break;
-        }
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let rows_per_thread = total_rows.div_ceil(threads.max(1));
+    let chunk_size = rows_per_thread * n;
+
+    if threads <= 1 || total_rows < 2 {
+        compute(&mut out_data, 0);
+    } else {
+        std::thread::scope(|s| {
+            let compute_ref = &compute;
+            for (t, out_chunk) in out_data.chunks_mut(chunk_size).enumerate() {
+                s.spawn(move || compute_ref(out_chunk, t * rows_per_thread));
+            }
+        });
     }
 
     write_f32(&out_tensor, out_data);
@@ -1023,18 +1122,40 @@ pub fn cross_entropy_backward(logits: &Tensor, targets: &Tensor, grad_out: &Tens
             gl_data[out_idx] = go_val * (p_c - target_indicator) / (batch_size as f32);
         }
     }
-
     write_f32(&grad_l, gl_data);
     grad_l
 }
 
-/// 2D convolution on CPU (direct, naive). NCHW input, OIHW weight, per-channel bias.
+
+/// Convolution lowered to a matrix multiply: `im2col` then GEMM.
+///
+/// # Relationship to [`conv2d`]
+///
+/// [`conv2d`] is the reference: scalar, deterministic, and bit-identical to the
+/// CUDA kernel, which was written to match its accumulation order. It is the
+/// correctness oracle and must stay that way.
+///
+/// This path trades that for speed. Convolution becomes a single
+/// `[cout, cin*kh*kw] x [cin*kh*kw, oh*ow]` product per image, handed to a
+/// blocked, threaded, SIMD GEMM. That reassociates the sum, so results agree
+/// with the reference to roughly 1e-5 rather than exactly. Anything relying on
+/// bit-equality must use [`conv2d`].
+///
+/// The im2col buffer costs `cin*kh*kw*oh*ow` floats per image, which is `kh*kw`
+/// times the input. That is the memory price of the speed, and it is why this is
+/// a separate function rather than a replacement.
 ///
 /// # Panics
-/// Panics if dtypes are not F32 or shapes are invalid for the given stride/padding.
+/// Panics if dtypes are not F32 or shapes disagree.
 #[must_use]
-#[allow(clippy::many_single_char_names, clippy::similar_names)]
-pub fn conv2d(
+// Strides are tensor dimensions, far below isize::MAX; a wrap would mean an
+// allocation larger than the address space.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::cast_possible_wrap
+)]
+pub fn conv2d_fast(
     input: &Tensor,
     weight: &Tensor,
     bias: &Tensor,
@@ -1044,7 +1165,7 @@ pub fn conv2d(
     assert_eq!(
         input.dtype(),
         vearo_core::DType::F32,
-        "conv2d input must be F32"
+        "conv2d_fast input must be F32"
     );
     let ic = input.contiguous();
     let wc = weight.contiguous();
@@ -1053,11 +1174,122 @@ pub fn conv2d(
     let wd = wc.shape().dims();
     let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
     let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
+    assert_eq!(wd[1], cin, "conv2d_fast channel mismatch");
+
+    let oh = (h + 2 * padding - kh) / stride + 1;
+    let ow = (w + 2 * padding - kw) / stride + 1;
+    let out_shape = Shape::new([n, cout, oh, ow]);
+    let out = Tensor::zeros(out_shape, vearo_core::DType::F32);
+    if out_shape.numel() == 0 {
+        return out;
+    }
+
+    let x = read_f32(&ic);
+    let wt = read_f32(&wc);
+    let b = read_f32(&bc);
+
+    let patch = cin * kh * kw;
+    let spatial = oh * ow;
+    let mut cols = vec![0.0f32; patch * spatial];
+    let mut out_data = vec![0.0f32; out_shape.numel()];
+
+    for nn in 0..n {
+        // im2col: row r = (c, i, j), column s = (y, x_out), so the product with
+        // the weight matrix laid out as [cout, patch] gives [cout, spatial].
+        for c in 0..cin {
+            for i in 0..kh {
+                for j in 0..kw {
+                    let row = (c * kh + i) * kw + j;
+                    let row_off = row * spatial;
+                    for y in 0..oh {
+                        let ih = y * stride + i;
+                        if ih < padding || ih >= h + padding {
+                            continue;
+                        }
+                        let ih = ih - padding;
+                        let src_row = ((nn * cin + c) * h + ih) * w;
+                        let dst_row = row_off + y * ow;
+                        for x_out in 0..ow {
+                            let iw = x_out * stride + j;
+                            if iw < padding || iw >= w + padding {
+                                continue;
+                            }
+                            cols[dst_row + x_out] = x[src_row + (iw - padding)];
+                        }
+                    }
+                }
+            }
+        }
+
+        // [cout, patch] x [patch, spatial] -> [cout, spatial], row-major, so
+        // column stride is 1 and row stride is the width.
+        let dst = &mut out_data[nn * cout * spatial..(nn + 1) * cout * spatial];
+        unsafe {
+            gemm::gemm(
+                cout,
+                spatial,
+                patch,
+                dst.as_mut_ptr(),
+                1,
+                spatial as isize,
+                false,
+                wt.as_ptr(),
+                1,
+                patch as isize,
+                cols.as_ptr(),
+                1,
+                spatial as isize,
+                0.0f32,
+                1.0f32,
+                false,
+                false,
+                false,
+                gemm::Parallelism::Rayon(0),
+            );
+        }
+
+        for co in 0..cout {
+            let base = co * spatial;
+            for v in &mut dst[base..base + spatial] {
+                *v += b[co];
+            }
+        }
+    }
+
+    write_f32(&out, out_data);
+    out
+}
+
+/// 2D convolution on CPU (optimized direct with padded input).
+///
+/// The reference implementation: deterministic, and bit-identical to the CUDA
+/// kernel, which was written to match its accumulation order. Use
+/// [`conv2d_fast`] when speed matters more than bit-equality.
+#[must_use]
+// The stride==1 path and the general path share their opening lines; keeping
+// them separate is what lets the common case stay branch-free inside the loop.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::branches_sharing_code
+)]
+pub fn conv2d(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> Tensor {
+    assert_eq!(input.dtype(), vearo_core::DType::F32, "conv2d input must be F32");
+    let ic = input.contiguous();
+    let wc = weight.contiguous();
+    let bc = bias.contiguous();
+
+    let id = ic.shape().dims();
+    let wd = wc.shape().dims();
+    let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
+    let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
     assert_eq!(wd[1], cin, "conv2d channel mismatch");
-    assert!(
-        h + 2 * padding >= kh && w + 2 * padding >= kw,
-        "conv2d kernel bigger than padded input"
-    );
 
     let oh = (h + 2 * padding - kh) / stride + 1;
     let ow = (w + 2 * padding - kw) / stride + 1;
@@ -1072,133 +1304,294 @@ pub fn conv2d(
     let b = read_f32(&bc);
     let mut out_data = vec![0.0f32; out_shape.numel()];
 
-    // Output elements are independent, so the (n, cout, oh, ow) space is split
-    // across threads. The inner reduction over (c, i, j) keeps its exact order
-    // and its accumulator chain, so results stay bit-identical to the serial
-    // version and to the CUDA kernel, which was written to match this order.
-    let per_image = cout * oh * ow;
-    let total = n * per_image;
+    let hp = h + 2 * padding;
+    let wp = w + 2 * padding;
+    let mut x_padded = vec![0.0f32; n * cin * hp * wp];
+    for nn in 0..n {
+        for c in 0..cin {
+            for ih in 0..h {
+                let src_offset = ((nn * cin + c) * h + ih) * w;
+                let dest_offset = ((nn * cin + c) * hp + ih + padding) * wp + padding;
+                x_padded[dest_offset..dest_offset + w].copy_from_slice(&x[src_offset..src_offset + w]);
+            }
+        }
+    }
+
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let chunk = total.div_ceil(threads.max(1));
+    let total_tasks = n * cout;
+    let tasks_per_thread = total_tasks.div_ceil(threads.max(1));
 
-    let compute = |out_chunk: &mut [f32], start: usize| {
-        for (k, slot) in out_chunk.iter_mut().enumerate() {
-            let o = start + k;
-            let x_out = o % ow;
-            let y = (o / ow) % oh;
-            let co = (o / (ow * oh)) % cout;
-            let nn = o / per_image;
+    let x_padded_ref = &x_padded;
+    let wt_ref = &wt;
+    let b_ref = &b;
+    let out_data_ptr = out_data.as_mut_ptr() as usize;
+    let out_data_len = out_data.len();
 
-            // Valid tap ranges, hoisted out of the reduction. A skipped tap
-            // added nothing to the accumulator, so restricting the loop to
-            // valid taps produces the identical sequence of operations.
-            let i_lo = padding.saturating_sub(y * stride);
-            let i_hi = kh.min((h + padding).saturating_sub(y * stride));
-            let j_lo = padding.saturating_sub(x_out * stride);
-            let j_hi = kw.min((w + padding).saturating_sub(x_out * stride));
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                let start_task = t * tasks_per_thread;
+                let end_task = (start_task + tasks_per_thread).min(total_tasks);
+                if start_task >= end_task {
+                    return;
+                }
 
-            let mut acc = b[co];
-            for c in 0..cin {
-                for i in i_lo..i_hi {
-                    let ih = y * stride + i - padding;
-                    let x_row = ((nn * cin + c) * h + ih) * w;
-                    let w_row = ((co * cin + c) * kh + i) * kw;
-                    for j in j_lo..j_hi {
-                        let iw = x_out * stride + j - padding;
-                        acc = x[x_row + iw].mul_add(wt[w_row + j], acc);
+                let local_out_data = unsafe { std::slice::from_raw_parts_mut(out_data_ptr as *mut f32, out_data_len) };
+
+                for task in start_task..end_task {
+                    let nn = task / cout;
+                    let co = task % cout;
+                    let bias_val = b_ref[co];
+
+                    let out_offset = ((nn * cout + co) * oh) * ow;
+                    local_out_data[out_offset .. out_offset + oh * ow].fill(bias_val);
+
+                    for c in 0..cin {
+                        for i in 0..kh {
+                            for j in 0..kw {
+                                let w_val = wt_ref[((co * cin + c) * kh + i) * kw + j];
+                                if w_val == 0.0 {
+                                    continue;
+                                }
+
+                                for y in 0..oh {
+                                    let x_row_offset = ((nn * cin + c) * hp + y * stride + i) * wp + j;
+                                    let dest_row_offset = out_offset + y * ow;
+
+                                    if stride == 1 {
+                                        let dest_slice = &mut local_out_data[dest_row_offset .. dest_row_offset + ow];
+                                        let src_slice = &x_padded_ref[x_row_offset .. x_row_offset + ow];
+                                        for x_out in 0..ow {
+                                            dest_slice[x_out] = w_val.mul_add(src_slice[x_out], dest_slice[x_out]);
+                                        }
+                                    } else {
+                                        let dest_slice = &mut local_out_data[dest_row_offset .. dest_row_offset + ow];
+                                        for x_out in 0..ow {
+                                            dest_slice[x_out] = w_val.mul_add(x_padded_ref[x_row_offset + x_out * stride], dest_slice[x_out]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            *slot = acc;
+            });
         }
-    };
-
-    if threads <= 1 || total < 4096 {
-        compute(&mut out_data, 0);
-    } else {
-        std::thread::scope(|s| {
-            for (t, out_chunk) in out_data.chunks_mut(chunk).enumerate() {
-                let compute = &compute;
-                s.spawn(move || compute(out_chunk, t * chunk));
-            }
-        });
-    }
+    });
 
     write_f32(&out, out_data);
     out
 }
 
-/// Backward for [`conv2d`]: returns `(grad_input, grad_weight, grad_bias)`.
-///
-/// # Panics
-/// Panics if dtypes are not F32.
+/// 2D convolution backward pass on CPU.
 #[must_use]
+// The stride==1 fast path and the general path share their opening lines; they
+// are kept separate so the common case stays branch-free in the inner loop.
 #[allow(
     clippy::many_single_char_names,
     clippy::similar_names,
-    clippy::too_many_lines
+    clippy::branches_sharing_code,
+    clippy::too_many_lines,
+    // Indices address several parallel buffers at once, so an iterator over one
+    // of them would not remove the indexing.
+    clippy::needless_range_loop
 )]
 pub fn conv2d_backward(
     input: &Tensor,
     weight: &Tensor,
-    grad_out: &Tensor,
+    grad_output: &Tensor,
     stride: usize,
     padding: usize,
 ) -> (Tensor, Tensor, Tensor) {
+    assert_eq!(input.dtype(), vearo_core::DType::F32);
     let ic = input.contiguous();
     let wc = weight.contiguous();
-    let gc = grad_out.contiguous();
+    let gc = grad_output.contiguous();
+
     let id = ic.shape().dims();
     let wd = wc.shape().dims();
+    let gd = gc.shape().dims();
     let (n, cin, h, w) = (id[0], id[1], id[2], id[3]);
     let (cout, kh, kw) = (wd[0], wd[2], wd[3]);
-    let gd = gc.shape().dims();
     let (oh, ow) = (gd[2], gd[3]);
+
+    let grad_input = Tensor::zeros(*ic.shape(), vearo_core::DType::F32);
+    let grad_weight = Tensor::zeros(*wc.shape(), vearo_core::DType::F32);
+    let grad_bias = Tensor::zeros(Shape::new([cout]), vearo_core::DType::F32);
 
     let x = read_f32(&ic);
     let wt = read_f32(&wc);
     let go = read_f32(&gc);
 
-    let mut gi = vec![0.0f32; ic.shape().numel()];
-    let mut gw = vec![0.0f32; wc.shape().numel()];
-    let mut gb = vec![0.0f32; cout];
+    let mut gi_data = vec![0.0f32; ic.shape().numel()];
+    let mut gw_data = vec![0.0f32; wc.shape().numel()];
+    let mut gb_data = vec![0.0f32; cout];
 
-    for nn in 0..n {
-        for co in 0..cout {
-            for y in 0..oh {
-                for x_out in 0..ow {
-                    let g = go[((nn * cout + co) * oh + y) * ow + x_out];
-                    gb[co] += g;
-                    for c in 0..cin {
-                        for i in 0..kh {
-                            let ih = y * stride + i;
-                            if ih < padding || ih >= h + padding {
-                                continue;
-                            }
-                            let ih = ih - padding;
-                            for j in 0..kw {
-                                let iw = x_out * stride + j;
-                                if iw < padding || iw >= w + padding {
-                                    continue;
-                                }
-                                let iw = iw - padding;
-                                let x_idx = ((nn * cin + c) * h + ih) * w + iw;
-                                let w_idx = ((co * cin + c) * kh + i) * kw + j;
-                                gw[w_idx] = g.mul_add(x[x_idx], gw[w_idx]);
-                                gi[x_idx] = g.mul_add(wt[w_idx], gi[x_idx]);
-                            }
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let co_per_thread = cout.div_ceil(threads.max(1));
+    let go_ref = &go;
+    let gb_ptr = gb_data.as_mut_ptr() as usize;
+
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                let co_start = t * co_per_thread;
+                let co_end = (co_start + co_per_thread).min(cout);
+                if co_start >= co_end {
+                    return;
+                }
+                let local_gb = unsafe { std::slice::from_raw_parts_mut(gb_ptr as *mut f32, cout) };
+                for co in co_start..co_end {
+                    let mut sum = 0.0f32;
+                    for b in 0..n {
+                        let base = ((b * cout + co) * oh) * ow;
+                        for i in 0..(oh * ow) {
+                            sum += go_ref[base + i];
                         }
                     }
+                    local_gb[co] = sum;
                 }
+            });
+        }
+    });
+    write_f32(&grad_bias, gb_data);
+
+    let hp = h + 2 * padding;
+    let wp = w + 2 * padding;
+    let mut x_padded = vec![0.0f32; n * cin * hp * wp];
+    for nn in 0..n {
+        for c in 0..cin {
+            for ih in 0..h {
+                let src_offset = ((nn * cin + c) * h + ih) * w;
+                let dest_offset = ((nn * cin + c) * hp + ih + padding) * wp + padding;
+                x_padded[dest_offset..dest_offset + w].copy_from_slice(&x[src_offset..src_offset + w]);
             }
         }
     }
 
-    (
-        Tensor::from_f32(&gi, *ic.shape()),
-        Tensor::from_f32(&gw, *wc.shape()),
-        Tensor::from_f32(&gb, [cout]),
-    )
+    let total_tasks_gw = cout * cin;
+    let gw_tasks_per_thread = total_tasks_gw.div_ceil(threads.max(1));
+    let x_padded_ref = &x_padded;
+    let gw_ptr = gw_data.as_mut_ptr() as usize;
+    let gw_data_len = gw_data.len();
+
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                let start_task = t * gw_tasks_per_thread;
+                let end_task = (start_task + gw_tasks_per_thread).min(total_tasks_gw);
+                if start_task >= end_task {
+                    return;
+                }
+
+                let local_gw = unsafe { std::slice::from_raw_parts_mut(gw_ptr as *mut f32, gw_data_len) };
+
+                for task in start_task..end_task {
+                    let co = task / cin;
+                    let c = task % cin;
+
+                    for i in 0..kh {
+                        for j in 0..kw {
+                            let gw_offset = ((co * cin + c) * kh + i) * kw + j;
+                            let mut acc = 0.0f32;
+
+                            for nn in 0..n {
+                                for y in 0..oh {
+                                    let x_row_offset = ((nn * cin + c) * hp + y * stride + i) * wp + j;
+                                    let go_row_offset = ((nn * cout + co) * oh + y) * ow;
+
+                                    if stride == 1 {
+                                        let src_x = &x_padded_ref[x_row_offset .. x_row_offset + ow];
+                                        let src_go = &go_ref[go_row_offset .. go_row_offset + ow];
+                                        for x_out in 0..ow {
+                                            acc = src_go[x_out].mul_add(src_x[x_out], acc);
+                                        }
+                                    } else {
+                                        for x_out in 0..ow {
+                                            let val_x = x_padded_ref[x_row_offset + x_out * stride];
+                                            let val_go = go_ref[go_row_offset + x_out];
+                                            acc = val_go.mul_add(val_x, acc);
+                                        }
+                                    }
+                                }
+                            }
+                            local_gw[gw_offset] = acc;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    write_f32(&grad_weight, gw_data);
+
+    let mut gi_padded = vec![0.0f32; n * cin * hp * wp];
+    let gi_padded_ptr = gi_padded.as_mut_ptr() as usize;
+    let gi_padded_len = gi_padded.len();
+    let total_tasks_gi = n * cin;
+    let gi_tasks_per_thread = total_tasks_gi.div_ceil(threads.max(1));
+    let wt_ref = &wt;
+
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                let start_task = t * gi_tasks_per_thread;
+                let end_task = (start_task + gi_tasks_per_thread).min(total_tasks_gi);
+                if start_task >= end_task {
+                    return;
+                }
+
+                let local_gi_padded = unsafe { std::slice::from_raw_parts_mut(gi_padded_ptr as *mut f32, gi_padded_len) };
+
+                for task in start_task..end_task {
+                    let nn = task / cin;
+                    let c = task % cin;
+
+                    for co in 0..cout {
+                        let go_offset = ((nn * cout + co) * oh) * ow;
+
+                        for i in 0..kh {
+                            for j in 0..kw {
+                                let w_val = wt_ref[((co * cin + c) * kh + i) * kw + j];
+                                if w_val == 0.0 {
+                                    continue;
+                                }
+
+                                for y in 0..oh {
+                                    let gi_row_offset = ((nn * cin + c) * hp + y * stride + i) * wp + j;
+                                    let go_row_offset = go_offset + y * ow;
+
+                                    if stride == 1 {
+                                        let dest_slice = unsafe { std::slice::from_raw_parts_mut(local_gi_padded.as_mut_ptr().add(gi_row_offset), ow) };
+                                        let src_slice = &go_ref[go_row_offset .. go_row_offset + ow];
+                                        for x_out in 0..ow {
+                                            dest_slice[x_out] = src_slice[x_out].mul_add(w_val, dest_slice[x_out]);
+                                        }
+                                    } else {
+                                        for x_out in 0..ow {
+                                            local_gi_padded[gi_row_offset + x_out * stride] = go_ref[go_row_offset + x_out].mul_add(w_val, local_gi_padded[gi_row_offset + x_out * stride]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    for nn in 0..n {
+        for c in 0..cin {
+            for ih in 0..h {
+                let src_offset = ((nn * cin + c) * hp + ih + padding) * wp + padding;
+                let dest_offset = ((nn * cin + c) * h + ih) * w;
+                gi_data[dest_offset..dest_offset + w].copy_from_slice(&gi_padded[src_offset..src_offset + w]);
+            }
+        }
+    }
+    write_f32(&grad_input, gi_data);
+
+    (grad_input, grad_weight, grad_bias)
 }
 
 /// 2D max pooling (NCHW). Padded positions are treated as -inf (never selected).
@@ -1218,8 +1611,15 @@ pub fn maxpool2d(input: &Tensor, kernel_size: usize, stride: usize, padding: usi
     let x = read_f32(&ic);
     let mut out_data = vec![0.0f32; out_shape.numel()];
 
-    for nn in 0..n {
-        for cc in 0..c {
+    let total_channels = n * c;
+    let in_channel_len = h * w;
+    let out_channel_len = oh * ow;
+
+    let compute = |out_channels: &mut [f32], start_channel: usize| {
+        for (ch_idx, out_channel_slice) in out_channels.chunks_exact_mut(out_channel_len).enumerate() {
+            let nc = start_channel + ch_idx;
+            let in_offset = nc * in_channel_len;
+
             for y in 0..oh {
                 for x_out in 0..ow {
                     let mut best = f32::NEG_INFINITY;
@@ -1235,16 +1635,31 @@ pub fn maxpool2d(input: &Tensor, kernel_size: usize, stride: usize, padding: usi
                                 continue;
                             }
                             let iw = iw - padding;
-                            let v = x[((nn * c + cc) * h + ih) * w + iw];
+                            let v = x[in_offset + ih * w + iw];
                             if v > best {
                                 best = v;
                             }
                         }
                     }
-                    out_data[((nn * c + cc) * oh + y) * ow + x_out] = best;
+                    out_channel_slice[y * ow + x_out] = best;
                 }
             }
         }
+    };
+
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let channels_per_thread = total_channels.div_ceil(threads.max(1));
+    let chunk_size = channels_per_thread * out_channel_len;
+
+    if threads <= 1 || total_channels < 2 {
+        compute(&mut out_data, 0);
+    } else {
+        std::thread::scope(|s| {
+            let compute_ref = &compute;
+            for (t, out_chunk) in out_data.chunks_mut(chunk_size).enumerate() {
+                s.spawn(move || compute_ref(out_chunk, t * channels_per_thread));
+            }
+        });
     }
 
     write_f32(&out, out_data);
@@ -1272,8 +1687,16 @@ pub fn maxpool2d_backward(
     let go = read_f32(&gc);
     let mut gi = vec![0.0f32; ic.shape().numel()];
 
-    for nn in 0..n {
-        for cc in 0..c {
+    let total_channels = n * c;
+    let in_channel_len = h * w;
+    let out_channel_len = oh * ow;
+
+    let compute = |gi_channels: &mut [f32], start_channel: usize| {
+        for (ch_idx, gi_channel_slice) in gi_channels.chunks_exact_mut(in_channel_len).enumerate() {
+            let nc = start_channel + ch_idx;
+            let in_offset = nc * in_channel_len;
+            let out_offset = nc * out_channel_len;
+
             for y in 0..oh {
                 for x_out in 0..ow {
                     let mut best = f32::NEG_INFINITY;
@@ -1290,19 +1713,37 @@ pub fn maxpool2d_backward(
                                 continue;
                             }
                             let iw = iw - padding;
-                            let idx = ((nn * c + cc) * h + ih) * w + iw;
-                            if x[idx] > best {
-                                best = x[idx];
-                                best_idx = idx;
+                            let local_idx = ih * w + iw;
+                            let idx = in_offset + local_idx;
+                            let v = x[idx];
+                            if v > best {
+                                best = v;
+                                best_idx = local_idx;
                             }
                         }
                     }
                     if best_idx != usize::MAX {
-                        gi[best_idx] += go[((nn * c + cc) * oh + y) * ow + x_out];
+                        let go_idx = out_offset + y * ow + x_out;
+                        gi_channel_slice[best_idx] += go[go_idx];
                     }
                 }
             }
         }
+    };
+
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let channels_per_thread = total_channels.div_ceil(threads.max(1));
+    let chunk_size = channels_per_thread * in_channel_len;
+
+    if threads <= 1 || total_channels < 2 {
+        compute(&mut gi, 0);
+    } else {
+        std::thread::scope(|s| {
+            let compute_ref = &compute;
+            for (t, gi_chunk) in gi.chunks_mut(chunk_size).enumerate() {
+                s.spawn(move || compute_ref(gi_chunk, t * channels_per_thread));
+            }
+        });
     }
 
     Tensor::from_f32(&gi, *ic.shape())

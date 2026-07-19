@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "CPU reference backend for Vearo, serving as the correctness oracle."
 
+# Keep the workspace lint profile (deny pedantic/nursery/missing_docs). Replacing
+# this with [lints.rust] would override the whole inherited set, silently
+# unlinting the reference backend. unsafe is allowed at the crate root instead.
 [lints]
 workspace = true
 
 [dependencies]
+gemm = "0.19.0"
 vearo-core.workspace = true
+
+[build-dependencies]
+cc = "1.0"
 

@@ -37,13 +37,13 @@ struct BenchCnn {
 }
 
 impl BenchCnn {
-    fn new() -> Self {
+    fn new(device: Device) -> Self {
         Self {
-            conv1: vearo::nn::Conv2d::new(CHANNELS, 16, 3, 1, 1, true, 1),
-            pool1: vearo::nn::MaxPool2d::new(2, 2, 0),
-            conv2: vearo::nn::Conv2d::new(16, 32, 3, 1, 1, true, 2),
-            pool2: vearo::nn::MaxPool2d::new(2, 2, 0),
-            fc: vearo::nn::Linear::new(32 * 8 * 8, CLASSES, true, 3),
+            conv1: vearo::nn::Conv2d::new(CHANNELS, 16, 3, 1, 1, true, 1).to(device),
+            pool1: vearo::nn::MaxPool2d::new(2, 2, 0).to(device),
+            conv2: vearo::nn::Conv2d::new(16, 32, 3, 1, 1, true, 2).to(device),
+            pool2: vearo::nn::MaxPool2d::new(2, 2, 0).to(device),
+            fc: vearo::nn::Linear::new(32 * 8 * 8, CLASSES, true, 3).to(device),
         }
     }
 
@@ -84,10 +84,11 @@ fn main() {
     let xs: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).sin()).collect();
     let ys: Vec<f32> = (0..BATCH).map(|i| (i % CLASSES) as f32).collect();
 
-    let x = Tensor::from_f32(&xs, [BATCH, CHANNELS, SIDE, SIDE]).to(Device::Cpu);
-    let y = Tensor::from_f32(&ys, [BATCH]).to(Device::Cpu);
+    let device = if vearo::cuda_available() { Device::Cuda(0) } else { Device::Cpu };
+    let x = Tensor::from_f32(&xs, [BATCH, CHANNELS, SIDE, SIDE]).to(device);
+    let y = Tensor::from_f32(&ys, [BATCH]).to(device);
 
-    let model = BenchCnn::new();
+    let model = BenchCnn::new(device);
     let mut opt = vearo::optim::AdamW::new(model.parameters(), 1e-3, 0.9, 0.999, 1e-8, 0.0);
 
     let rss_before = peak_rss_mib();
@@ -116,7 +117,7 @@ fn main() {
 
     let rss_after = peak_rss_mib();
 
-    println!("framework      vearo (cpu, single-threaded)");
+    println!("framework      vearo (device: {:?})", device);
     println!("model          conv(3-16) pool conv(16-32) pool fc({}-{CLASSES})", 32 * 8 * 8);
     println!("input          [{BATCH}, {CHANNELS}, {SIDE}, {SIDE}]");
     println!("steps          {STEPS} (after {WARMUP} warmup)");
